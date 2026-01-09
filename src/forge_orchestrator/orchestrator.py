@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -10,7 +11,11 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic_ai import Agent
 from pydantic_ai.mcp import MCPServerStreamableHTTP
-from pydantic_ai.messages import ModelMessage
+from pydantic_ai.messages import (
+    ModelMessage,
+    ToolCallPart,
+    ToolReturnPart,
+)
 
 from forge_orchestrator.logging import get_logger
 from forge_orchestrator.mcp_client import ArmoryClient
@@ -255,6 +260,7 @@ class AgentOrchestrator:
         toolsets = []
         if self._mcp_server and self._armory_available:
             toolsets.append(self._mcp_server)
+            logger.info("MCP toolset added to agent")
         elif not self._armory_available:
             yield ErrorEvent(
                 code="ARMORY_UNAVAILABLE",
@@ -263,8 +269,10 @@ class AgentOrchestrator:
             )
 
         # Create agent
+        model_string = self._get_model_string(actual_model)
+        logger.info("Creating agent", model=model_string, has_toolsets=bool(toolsets))
         agent = Agent(
-            model=self._get_model_string(actual_model),
+            model=model_string,
             toolsets=toolsets,
         )
 
@@ -280,15 +288,23 @@ class AgentOrchestrator:
 
         try:
             async with agent:
-                # Use run_stream for text streaming
+                logger.info("Agent context entered, starting run_stream")
+
+                # Track tool calls in progress
+                active_tool_calls: dict[str, float] = {}  # tool_call_id -> start_time
+
+                # Use run_stream with stream() for full event access including tools
                 async with agent.run_stream(
                     user_message,
                     message_history=message_history if message_history else None,
                 ) as result:
-                    # Stream text tokens
+                    logger.info("run_stream started")
+
+                    # Stream text - this iterates the agent loop including tool calls
                     async for delta in result.stream_text(delta=True):
-                        cumulative_text += delta
-                        yield TokenEvent(token=delta, cumulative=cumulative_text)
+                        if delta:
+                            cumulative_text += delta
+                            yield TokenEvent(token=delta, cumulative=cumulative_text)
 
                         # Send ping if needed
                         now = time.time()
@@ -296,7 +312,51 @@ class AgentOrchestrator:
                             yield PingEvent(timestamp=int(now))
                             last_ping = now
 
-                    # Get final result and usage
+                    logger.info("Streaming complete", cumulative_text_len=len(cumulative_text))
+
+                    # Extract tool calls and results from conversation history
+                    for msg in result.new_messages():
+                        if hasattr(msg, 'parts'):
+                            for part in msg.parts:
+                                if isinstance(part, ToolCallPart):
+                                    logger.info(
+                                        "Tool call in history",
+                                        tool_name=part.tool_name,
+                                        tool_call_id=part.tool_call_id,
+                                    )
+                                    try:
+                                        args = json.loads(part.args) if isinstance(part.args, str) else part.args
+                                    except Exception:
+                                        args = {"raw": part.args}
+
+                                    yield ToolCallEvent(
+                                        id=part.tool_call_id or f"tc_{uuid.uuid4().hex[:8]}",
+                                        tool_name=part.tool_name,
+                                        arguments=args,
+                                        status="complete",
+                                    )
+
+                                elif isinstance(part, ToolReturnPart):
+                                    logger.info(
+                                        "Tool result in history",
+                                        tool_name=part.tool_name,
+                                        tool_call_id=part.tool_call_id,
+                                        content_preview=str(part.content)[:100],
+                                    )
+                                    try:
+                                        result_content = json.loads(part.content) if isinstance(part.content, str) else part.content
+                                    except Exception:
+                                        result_content = part.content
+
+                                    is_error = "not executed" in str(part.content).lower() if part.content else False
+                                    yield ToolResultEvent(
+                                        tool_call_id=part.tool_call_id or "unknown",
+                                        result=result_content,
+                                        is_error=is_error,
+                                        latency_ms=0,
+                                    )
+
+                    # Get usage stats
                     usage = None
                     if hasattr(result, "usage") and result.usage:
                         usage_data = result.usage()
