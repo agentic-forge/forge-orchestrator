@@ -55,8 +55,7 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8001
 
-    # Storage
-    conversations_dir: Path = Path.home() / ".forge" / "conversations"
+    # Storage (only for caching, not conversation persistence)
     models_cache_file: Path = Path.home() / ".forge" / "models_cache.json"
 
     # Model selection

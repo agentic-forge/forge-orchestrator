@@ -30,7 +30,6 @@ from forge_orchestrator.models_cache import ModelsCache
 from forge_orchestrator.openrouter_client import OpenRouterClient
 
 if TYPE_CHECKING:
-    from forge_orchestrator.models import Conversation
     from forge_orchestrator.settings import Settings
 
 logger = get_logger(__name__)
@@ -44,13 +43,18 @@ class ModelError(OrchestratorError):
     """Error from the LLM model."""
 
 
-class CancellationError(OrchestratorError):
-    """Generation was cancelled."""
+class MessageInput:
+    """Simple message input for building history."""
+
+    def __init__(self, role: str, content: str) -> None:
+        self.role = role
+        self.content = content
 
 
 class AgentOrchestrator:
     """Orchestrates LLM agent interactions with streaming.
 
+    Stateless orchestrator - each request provides its own message history.
     Uses Pydantic AI for model abstraction and MCP for tool access via Armory.
     """
 
@@ -63,8 +67,6 @@ class AgentOrchestrator:
         self.settings = settings
         self._mcp_server: MCPServerStreamableHTTP | None = None
         self._armory_client: ArmoryClient | None = None
-        self._active_runs: dict[str, asyncio.Task[None]] = {}
-        self._cancelled: set[str] = set()
         self._armory_available = False
 
         # Models cache and OpenRouter client
@@ -105,14 +107,8 @@ class AgentOrchestrator:
             )
 
     async def shutdown(self) -> None:
-        """Shutdown the orchestrator and cancel active runs."""
-        # Cancel all active runs
-        for conv_id, task in self._active_runs.items():
-            task.cancel()
-            logger.info("Cancelled active run", conversation_id=conv_id)
-
-        self._active_runs.clear()
-        self._cancelled.clear()
+        """Shutdown the orchestrator."""
+        logger.info("Orchestrator shutdown")
 
     async def refresh_tools(self) -> list[dict[str, Any]]:
         """Refresh tools from Armory.
@@ -179,12 +175,15 @@ class AgentOrchestrator:
         return models_data
 
     def _build_message_history(
-        self, conversation: Conversation
+        self,
+        messages: list[Any],
+        system_prompt: str | None = None,
     ) -> list[ModelMessage]:
-        """Build Pydantic AI message history from conversation.
+        """Build Pydantic AI message history from message list.
 
         Args:
-            conversation: The conversation to build history from.
+            messages: List of messages with role and content.
+            system_prompt: Optional system prompt.
 
         Returns:
             List of ModelMessage for Pydantic AI.
@@ -197,60 +196,60 @@ class AgentOrchestrator:
             UserPromptPart,
         )
 
-        messages: list[ModelMessage] = []
+        result: list[ModelMessage] = []
 
         # Add system prompt as first message if present
-        if conversation.metadata.system_prompt:
-            messages.append(
-                ModelRequest(
-                    parts=[SystemPromptPart(content=conversation.metadata.system_prompt)]
-                )
+        if system_prompt:
+            result.append(
+                ModelRequest(parts=[SystemPromptPart(content=system_prompt)])
             )
 
-        # Convert conversation messages
-        for msg in conversation.messages:
-            if msg.role == "user":
-                messages.append(
-                    ModelRequest(parts=[UserPromptPart(content=msg.content)])
-                )
-            elif msg.role == "assistant":
-                messages.append(
-                    ModelResponse(parts=[TextPart(content=msg.content)])
-                )
-            # Skip tool_call and tool_result for now - they're handled internally
+        # Convert messages
+        for msg in messages:
+            # Handle both dict and object with attributes
+            role = msg.role if hasattr(msg, "role") else msg.get("role")
+            content = msg.content if hasattr(msg, "content") else msg.get("content", "")
 
-        return messages
+            if role == "user":
+                result.append(
+                    ModelRequest(parts=[UserPromptPart(content=content)])
+                )
+            elif role == "assistant":
+                result.append(
+                    ModelResponse(parts=[TextPart(content=content)])
+                )
+            # Skip tool_call and tool_result - they're handled internally by Pydantic AI
+
+        return result
 
     async def run_stream(
         self,
-        conversation: Conversation,
         user_message: str,
+        messages: list[Any] | None = None,
+        system_prompt: str | None = None,
+        model: str | None = None,
     ) -> AsyncIterator[SSEEvent]:
         """Execute agent loop and yield SSE events.
 
+        Stateless - all context is provided in the request.
+
         Args:
-            conversation: The conversation to continue.
             user_message: The user's message.
+            messages: Previous conversation history.
+            system_prompt: Optional system prompt.
+            model: Optional model override.
 
         Yields:
             SSE events for the response.
         """
-        conv_id = conversation.metadata.id
-
-        # Check if cancelled
-        if conv_id in self._cancelled:
-            self._cancelled.discard(conv_id)
-            yield ErrorEvent(code="CANCELLED", message="Generation cancelled", retryable=False)
-            return
-
         # Use mock mode if enabled
         if self.settings.mock_llm:
             async for event in self._run_mock_stream(user_message):
                 yield event
             return
 
-        # Get model from conversation or use default
-        model = conversation.metadata.model or self.settings.default_model
+        # Get model or use default
+        actual_model = model or self.settings.default_model
 
         # Build toolsets
         toolsets = []
@@ -265,12 +264,15 @@ class AgentOrchestrator:
 
         # Create agent
         agent = Agent(
-            model=self._get_model_string(model),
+            model=self._get_model_string(actual_model),
             toolsets=toolsets,
         )
 
         # Build message history
-        message_history = self._build_message_history(conversation)
+        message_history = self._build_message_history(
+            messages or [],
+            system_prompt,
+        )
 
         # Track state for streaming
         cumulative_text = ""
@@ -285,16 +287,6 @@ class AgentOrchestrator:
                 ) as result:
                     # Stream text tokens
                     async for delta in result.stream_text(delta=True):
-                        # Check for cancellation
-                        if conv_id in self._cancelled:
-                            self._cancelled.discard(conv_id)
-                            yield ErrorEvent(
-                                code="CANCELLED",
-                                message="Generation cancelled",
-                                retryable=False,
-                            )
-                            return
-
                         cumulative_text += delta
                         yield TokenEvent(token=delta, cumulative=cumulative_text)
 
@@ -310,8 +302,8 @@ class AgentOrchestrator:
                         usage_data = result.usage()
                         if usage_data:
                             usage = TokenUsage(
-                                prompt_tokens=usage_data.request_tokens or 0,
-                                completion_tokens=usage_data.response_tokens or 0,
+                                prompt_tokens=usage_data.input_tokens or 0,
+                                completion_tokens=usage_data.output_tokens or 0,
                             )
 
                     yield CompleteEvent(response=cumulative_text, usage=usage)
@@ -319,7 +311,7 @@ class AgentOrchestrator:
         except asyncio.CancelledError:
             yield ErrorEvent(code="CANCELLED", message="Generation cancelled", retryable=False)
         except Exception as e:
-            logger.exception("Error during agent run", conversation_id=conv_id)
+            logger.exception("Error during agent run")
             yield ErrorEvent(
                 code="MODEL_ERROR",
                 message=str(e),
@@ -380,25 +372,6 @@ class AgentOrchestrator:
             response=cumulative.strip(),
             usage=TokenUsage(prompt_tokens=50, completion_tokens=len(response.split())),
         )
-
-    async def cancel(self, conv_id: str) -> bool:
-        """Cancel an active generation.
-
-        Args:
-            conv_id: The conversation ID to cancel.
-
-        Returns:
-            True if cancelled, False if no active run.
-        """
-        self._cancelled.add(conv_id)
-
-        if conv_id in self._active_runs:
-            self._active_runs[conv_id].cancel()
-            del self._active_runs[conv_id]
-            logger.info("Cancelled generation", conversation_id=conv_id)
-            return True
-
-        return False
 
     def _get_model_string(self, model: str) -> str:
         """Convert model name to Pydantic AI format.

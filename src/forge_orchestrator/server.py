@@ -8,15 +8,13 @@ from typing import Annotated, Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
-from forge_orchestrator.conversation import ConversationManager
 from forge_orchestrator.logging import configure_logging, get_logger
 from forge_orchestrator.models.messages import get_event_type
 from forge_orchestrator.orchestrator import AgentOrchestrator
 from forge_orchestrator.settings import settings
-from forge_orchestrator.storage import ConversationNotFoundError, ConversationStorage
 
 logger = get_logger(__name__)
 
@@ -26,51 +24,29 @@ logger = get_logger(__name__)
 # ============================================================================
 
 
-class CreateConversationRequest(BaseModel):
-    """Request body for creating a conversation."""
+class MessageInput(BaseModel):
+    """A message in the conversation history."""
 
-    system_prompt: str | None = None
-    model: str | None = None
-
-
-class CreateConversationResponse(BaseModel):
-    """Response body for creating a conversation."""
-
-    id: str
-    model: str
-    system_prompt: str
-
-
-class SendMessageRequest(BaseModel):
-    """Request body for sending a message."""
-
-    content: str
-    model: str | None = None  # Override model for this message
-
-
-class SendMessageResponse(BaseModel):
-    """Response body for send message (returns immediately)."""
-
-    status: str = "accepted"
-    stream_url: str
-
-
-class UpdateSystemPromptRequest(BaseModel):
-    """Request body for updating system prompt."""
-
+    role: str  # "user" | "assistant" | "system"
     content: str
 
 
-class CancelResponse(BaseModel):
-    """Response body for cancel endpoint."""
+class ChatRequest(BaseModel):
+    """Request body for stateless chat."""
 
-    cancelled: bool
-
-
-class DeleteResponse(BaseModel):
-    """Response body for delete endpoints."""
-
-    deleted: bool
+    user_message: str = Field(description="The new user message to send")
+    messages: list[MessageInput] = Field(
+        default_factory=list,
+        description="Previous conversation history",
+    )
+    system_prompt: str | None = Field(
+        default=None,
+        description="System prompt for the conversation",
+    )
+    model: str | None = Field(
+        default=None,
+        description="Model to use (defaults to server default)",
+    )
 
 
 class HealthResponse(BaseModel):
@@ -100,23 +76,13 @@ async def lifespan(app: FastAPI):
 
     logger.info("Starting Forge Orchestrator...")
 
-    # Initialize storage
-    storage = ConversationStorage(settings.conversations_dir)
-    await storage.ensure_dir()
-    logger.info("Storage initialized", path=str(settings.conversations_dir))
-
     # Initialize orchestrator
     orchestrator = AgentOrchestrator(settings)
     await orchestrator.initialize()
     logger.info("Orchestrator initialized", mock_mode=settings.mock_llm)
 
-    # Create manager
-    manager = ConversationManager(storage, orchestrator)
-
     # Store in app state
-    app.state.storage = storage
     app.state.orchestrator = orchestrator
-    app.state.manager = manager
 
     logger.info(
         "Forge Orchestrator started",
@@ -139,8 +105,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Forge Orchestrator",
-    description="LLM agent loop for Agentic Forge - connects UI to language models and MCP tools",
-    version="0.1.0",
+    description="Stateless LLM agent loop for Agentic Forge - connects UI to language models and MCP tools",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -272,103 +238,42 @@ async def refresh_models(request: Request) -> dict[str, Any]:
 
 
 # ============================================================================
-# Conversation Endpoints
+# Stateless Chat Endpoint
 # ============================================================================
 
 
-@app.post("/conversations", response_model=CreateConversationResponse)
-async def create_conversation(
+@app.post("/chat/stream")
+async def chat_stream(
     request: Request,
-    body: CreateConversationRequest,
-) -> CreateConversationResponse:
-    """Create a new conversation."""
-    manager: ConversationManager = request.app.state.manager
-
-    conversation = await manager.create(
-        model=body.model,
-        system_prompt=body.system_prompt,
-    )
-
-    return CreateConversationResponse(
-        id=conversation.metadata.id,
-        model=conversation.metadata.model,
-        system_prompt=conversation.metadata.system_prompt,
-    )
-
-
-@app.get("/conversations/{conv_id}")
-async def get_conversation(request: Request, conv_id: str) -> dict[str, Any]:
-    """Get conversation state."""
-    manager: ConversationManager = request.app.state.manager
-
-    conversation = await manager.get(conv_id)
-    if conversation is None:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-
-    return conversation.model_dump(mode="json")
-
-
-@app.delete("/conversations/{conv_id}", response_model=DeleteResponse)
-async def delete_conversation(request: Request, conv_id: str) -> DeleteResponse:
-    """Delete a conversation."""
-    manager: ConversationManager = request.app.state.manager
-
-    deleted = await manager.delete(conv_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-
-    return DeleteResponse(deleted=True)
-
-
-@app.post("/conversations/{conv_id}/messages", response_model=SendMessageResponse)
-async def send_message(
-    request: Request,
-    conv_id: str,
-    body: SendMessageRequest,
-) -> SendMessageResponse:
-    """Send a message (returns immediately, use SSE for response).
-
-    The actual response is streamed via the /conversations/{id}/stream endpoint.
-    """
-    manager: ConversationManager = request.app.state.manager
-
-    # Validate conversation exists
-    conversation = await manager.get(conv_id)
-    if conversation is None:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-
-    return SendMessageResponse(
-        status="accepted",
-        stream_url=f"/conversations/{conv_id}/stream?message={body.content}",
-    )
-
-
-@app.get("/conversations/{conv_id}/stream")
-async def stream_response(
-    request: Request,
-    conv_id: str,
-    message: Annotated[str, Query(description="The message to send")],
-    model: Annotated[str | None, Query(description="Optional model override")] = None,
+    body: ChatRequest,
 ) -> EventSourceResponse:
-    """SSE stream for conversation events.
+    """Stateless chat endpoint with SSE streaming.
+
+    Sends a message with conversation history and streams the response.
+    The client is responsible for maintaining conversation state.
 
     Streams:
     - token: Streaming text tokens
-    - thinking: Model thinking content
+    - thinking: Model thinking content (if supported)
     - tool_call: Tool execution status
     - tool_result: Tool execution result
-    - complete: Response complete
+    - complete: Response complete with usage stats
     - error: Error occurred
     - ping: Heartbeat
     """
-    manager: ConversationManager = request.app.state.manager
+    orchestrator: AgentOrchestrator = request.app.state.orchestrator
 
     async def event_generator():
-        """Generate SSE events from the manager."""
+        """Generate SSE events from the orchestrator."""
         last_ping = time.time()
 
         try:
-            async for event in manager.send_message(conv_id, message, model):
+            async for event in orchestrator.run_stream(
+                user_message=body.user_message,
+                messages=body.messages,
+                system_prompt=body.system_prompt,
+                model=body.model,
+            ):
                 # Get event type and serialize
                 event_type = get_event_type(event)
                 yield {
@@ -387,21 +292,10 @@ async def stream_response(
                     }
                     last_ping = now
 
-        except ConversationNotFoundError:
-            from forge_orchestrator.models import ErrorEvent
-
-            yield {
-                "event": "error",
-                "data": ErrorEvent(
-                    code="NOT_FOUND",
-                    message="Conversation not found",
-                    retryable=False,
-                ).model_dump_json(),
-            }
         except Exception as e:
             from forge_orchestrator.models import ErrorEvent
 
-            logger.exception("Error in SSE stream", conversation_id=conv_id)
+            logger.exception("Error in SSE stream")
             yield {
                 "event": "error",
                 "data": ErrorEvent(
@@ -418,49 +312,3 @@ async def stream_response(
             "Cache-Control": "no-cache",
         },
     )
-
-
-@app.post("/conversations/{conv_id}/cancel", response_model=CancelResponse)
-async def cancel_generation(request: Request, conv_id: str) -> CancelResponse:
-    """Cancel an ongoing generation."""
-    manager: ConversationManager = request.app.state.manager
-
-    # Validate conversation exists
-    conversation = await manager.get(conv_id)
-    if conversation is None:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-
-    cancelled = await manager.cancel(conv_id)
-    return CancelResponse(cancelled=cancelled)
-
-
-@app.delete("/conversations/{conv_id}/messages/{index}", response_model=dict[str, Any])
-async def delete_messages(
-    request: Request,
-    conv_id: str,
-    index: int,
-) -> dict[str, Any]:
-    """Delete message at index and all following messages."""
-    manager: ConversationManager = request.app.state.manager
-
-    try:
-        conversation = await manager.delete_messages_from(conv_id, index)
-        return conversation.model_dump(mode="json")
-    except ConversationNotFoundError:
-        raise HTTPException(status_code=404, detail="Conversation not found") from None
-
-
-@app.patch("/conversations/{conv_id}/system-prompt", response_model=dict[str, Any])
-async def update_system_prompt(
-    request: Request,
-    conv_id: str,
-    body: UpdateSystemPromptRequest,
-) -> dict[str, Any]:
-    """Update the system prompt for a conversation."""
-    manager: ConversationManager = request.app.state.manager
-
-    try:
-        conversation = await manager.update_system_prompt(conv_id, body.content)
-        return conversation.model_dump(mode="json")
-    except ConversationNotFoundError:
-        raise HTTPException(status_code=404, detail="Conversation not found") from None

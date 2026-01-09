@@ -6,9 +6,6 @@ from typing import TYPE_CHECKING
 
 from forge_orchestrator.models import (
     CompleteEvent,
-    Conversation,
-    ConversationMetadata,
-    ErrorEvent,
     ToolCallEvent,
     ToolResultEvent,
 )
@@ -32,16 +29,13 @@ class TestAgentOrchestrator:
         self, initialized_orchestrator: AgentOrchestrator
     ) -> None:
         """Test basic mock streaming."""
-        conv = Conversation(
-            metadata=ConversationMetadata(
-                id="test_conv",
-                model="test-model",
-            ),
-            messages=[],
-        )
-
         events = []
-        async for event in initialized_orchestrator.run_stream(conv, "Hello"):
+        async for event in initialized_orchestrator.run_stream(
+            user_message="Hello",
+            messages=[],
+            system_prompt=None,
+            model="test-model",
+        ):
             events.append(event)
 
         # Should have thinking, tokens, and complete
@@ -54,17 +48,12 @@ class TestAgentOrchestrator:
         self, initialized_orchestrator: AgentOrchestrator
     ) -> None:
         """Test mock streaming with tool call trigger."""
-        conv = Conversation(
-            metadata=ConversationMetadata(
-                id="test_conv",
-                model="test-model",
-            ),
-            messages=[],
-        )
-
         events = []
         async for event in initialized_orchestrator.run_stream(
-            conv, "What's the weather?"
+            user_message="What's the weather?",
+            messages=[],
+            system_prompt=None,
+            model="test-model",
         ):
             events.append(event)
 
@@ -89,16 +78,13 @@ class TestAgentOrchestrator:
         self, initialized_orchestrator: AgentOrchestrator
     ) -> None:
         """Test that complete event includes usage stats."""
-        conv = Conversation(
-            metadata=ConversationMetadata(
-                id="test_conv",
-                model="test-model",
-            ),
-            messages=[],
-        )
-
         events = []
-        async for event in initialized_orchestrator.run_stream(conv, "Hi"):
+        async for event in initialized_orchestrator.run_stream(
+            user_message="Hi",
+            messages=[],
+            system_prompt=None,
+            model="test-model",
+        ):
             events.append(event)
 
         complete_events = [e for e in events if isinstance(e, CompleteEvent)]
@@ -106,29 +92,27 @@ class TestAgentOrchestrator:
         assert complete_events[0].usage is not None
         assert complete_events[0].usage.prompt_tokens > 0
 
-    async def test_cancel_run(
+    async def test_run_stream_with_history(
         self, initialized_orchestrator: AgentOrchestrator
     ) -> None:
-        """Test cancellation."""
-        conv = Conversation(
-            metadata=ConversationMetadata(
-                id="test_cancel",
-                model="test-model",
-            ),
-            messages=[],
-        )
-
-        # Start a run and cancel it
-        initialized_orchestrator._cancelled.add("test_cancel")
+        """Test streaming with message history."""
+        history = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Hi there!"},
+        ]
 
         events = []
-        async for event in initialized_orchestrator.run_stream(conv, "Hello"):
+        async for event in initialized_orchestrator.run_stream(
+            user_message="How are you?",
+            messages=history,
+            system_prompt="You are a helpful assistant.",
+            model="test-model",
+        ):
             events.append(event)
 
-        # Should get a cancelled error
-        error_events = [e for e in events if isinstance(e, ErrorEvent)]
-        assert len(error_events) == 1
-        assert error_events[0].code == "CANCELLED"
+        # Should complete successfully
+        complete_events = [e for e in events if isinstance(e, CompleteEvent)]
+        assert len(complete_events) == 1
 
     async def test_list_tools_empty_in_mock(
         self, initialized_orchestrator: AgentOrchestrator
