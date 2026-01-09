@@ -17,6 +17,13 @@ from forge_orchestrator.models.messages import (
     ToolCallEvent,
     ToolResultEvent,
 )
+from forge_orchestrator.models.openrouter import (
+    ModelInfo,
+    ModelPricing,
+    ModelsData,
+    ModelsRefreshResponse,
+    ModelsResponse,
+)
 
 __all__ = [
     # Conversation models
@@ -34,4 +41,10 @@ __all__ = [
     "ErrorEvent",
     "PingEvent",
     "SSEEvent",
+    # OpenRouter models
+    "ModelInfo",
+    "ModelPricing",
+    "ModelsData",
+    "ModelsResponse",
+    "ModelsRefreshResponse",
 ]

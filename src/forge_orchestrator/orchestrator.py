@@ -17,6 +17,7 @@ from forge_orchestrator.mcp_client import ArmoryClient
 from forge_orchestrator.models import (
     CompleteEvent,
     ErrorEvent,
+    ModelsData,
     PingEvent,
     SSEEvent,
     ThinkingEvent,
@@ -25,6 +26,8 @@ from forge_orchestrator.models import (
     ToolCallEvent,
     ToolResultEvent,
 )
+from forge_orchestrator.models_cache import ModelsCache
+from forge_orchestrator.openrouter_client import OpenRouterClient
 
 if TYPE_CHECKING:
     from forge_orchestrator.models import Conversation
@@ -63,6 +66,14 @@ class AgentOrchestrator:
         self._active_runs: dict[str, asyncio.Task[None]] = {}
         self._cancelled: set[str] = set()
         self._armory_available = False
+
+        # Models cache and OpenRouter client
+        self._models_cache = ModelsCache(settings.models_cache_file)
+        self._openrouter_client = OpenRouterClient(
+            base_url=settings.openrouter_base_url,
+            provider_whitelist=settings.provider_whitelist,
+            models_per_provider=settings.models_per_provider,
+        )
 
     async def initialize(self) -> None:
         """Initialize the orchestrator and connect to Armory."""
@@ -136,6 +147,36 @@ class AgentOrchestrator:
         except Exception as e:
             logger.warning("Failed to list tools", error=str(e))
             return []
+
+    async def get_models(self) -> ModelsData | None:
+        """Get cached models data.
+
+        Returns:
+            ModelsData if cache exists, None otherwise.
+        """
+        return await self._models_cache.load()
+
+    async def refresh_models(self) -> ModelsData:
+        """Fetch models from OpenRouter and update cache.
+
+        Returns:
+            The refreshed ModelsData.
+        """
+        logger.info("Refreshing models from OpenRouter")
+
+        # Fetch from OpenRouter
+        models_data = await self._openrouter_client.fetch_models()
+
+        # Save to cache
+        await self._models_cache.save(models_data)
+
+        logger.info(
+            "Models cache refreshed",
+            model_count=len(models_data.models),
+            provider_count=len(models_data.providers),
+        )
+
+        return models_data
 
     def _build_message_history(
         self, conversation: Conversation

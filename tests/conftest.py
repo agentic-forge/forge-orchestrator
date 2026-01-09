@@ -23,7 +23,7 @@ def mock_settings(tmp_path: Path) -> Settings:
     class TestSettings(Settings):
         """Test settings with overrides."""
 
-        model_config = {"env_prefix": "TEST_ORCHESTRATOR_"}
+        model_config = {"env_prefix": "TEST_ORCHESTRATOR_", "extra": "ignore"}
 
     return TestSettings(
         armory_url="http://localhost:8080/mcp",
@@ -31,6 +31,7 @@ def mock_settings(tmp_path: Path) -> Settings:
         host="127.0.0.1",
         port=8001,
         conversations_dir=tmp_path / "conversations",
+        models_cache_file=tmp_path / "models_cache.json",
         mock_llm=True,
         show_thinking=True,
         heartbeat_interval=15,

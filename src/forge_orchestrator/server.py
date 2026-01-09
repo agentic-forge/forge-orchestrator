@@ -190,6 +190,88 @@ async def refresh_tools(request: Request) -> ToolsRefreshResponse:
 
 
 # ============================================================================
+# Models Endpoints
+# ============================================================================
+
+
+@app.get("/models")
+async def list_models(
+    request: Request,
+    provider: Annotated[str | None, Query(description="Filter by provider")] = None,
+    supports_tools: Annotated[
+        bool | None, Query(description="Filter by tool calling support")
+    ] = None,
+    supports_vision: Annotated[
+        bool | None, Query(description="Filter by vision support")
+    ] = None,
+) -> dict[str, Any]:
+    """List available models from cache.
+
+    Returns cached models with optional filtering. If cache is empty,
+    returns empty list (use POST /models/refresh to populate).
+    """
+    from forge_orchestrator.models import ModelsResponse
+
+    orchestrator: AgentOrchestrator = request.app.state.orchestrator
+
+    models_data = await orchestrator.get_models()
+
+    if models_data is None:
+        return ModelsResponse(
+            providers=[],
+            models=[],
+            cached_at=None,
+        ).model_dump(mode="json")
+
+    # Apply filters
+    filtered_models = models_data.models
+
+    if provider is not None:
+        filtered_models = [m for m in filtered_models if m.provider == provider]
+
+    if supports_tools is not None:
+        filtered_models = [m for m in filtered_models if m.supports_tools == supports_tools]
+
+    if supports_vision is not None:
+        filtered_models = [m for m in filtered_models if m.supports_vision == supports_vision]
+
+    # Get unique providers from filtered models
+    providers = sorted({m.provider for m in filtered_models})
+
+    return ModelsResponse(
+        providers=providers,
+        models=filtered_models,
+        cached_at=models_data.fetched_at,
+    ).model_dump(mode="json")
+
+
+@app.post("/models/refresh")
+async def refresh_models(request: Request) -> dict[str, Any]:
+    """Refresh models cache from OpenRouter.
+
+    Fetches the latest models from OpenRouter API and updates the cache.
+    """
+    from forge_orchestrator.models import ModelsRefreshResponse
+    from forge_orchestrator.openrouter_client import OpenRouterError
+
+    orchestrator: AgentOrchestrator = request.app.state.orchestrator
+
+    try:
+        models_data = await orchestrator.refresh_models()
+        return ModelsRefreshResponse(
+            status="refreshed",
+            model_count=len(models_data.models),
+            provider_count=len(models_data.providers),
+        ).model_dump(mode="json")
+    except OpenRouterError as e:
+        logger.error("Failed to refresh models", error=str(e))
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to fetch models from OpenRouter: {e}",
+        ) from e
+
+
+# ============================================================================
 # Conversation Endpoints
 # ============================================================================
 

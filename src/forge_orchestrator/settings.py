@@ -8,6 +8,7 @@ from pathlib import Path
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+
 def _load_env_file(env_path: Path) -> None:
     """Load .env file into os.environ."""
     if not env_path.exists():
@@ -56,6 +57,18 @@ class Settings(BaseSettings):
 
     # Storage
     conversations_dir: Path = Path.home() / ".forge" / "conversations"
+    models_cache_file: Path = Path.home() / ".forge" / "models_cache.json"
+
+    # Model selection
+    provider_whitelist: list[str] = [
+        "anthropic",
+        "openai",
+        "google",
+        "deepseek",
+        "moonshotai",
+        "qwen",
+    ]
+    models_per_provider: int = 3
 
     # Features
     mock_llm: bool = False  # For testing without real LLM
