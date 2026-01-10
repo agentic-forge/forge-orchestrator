@@ -25,6 +25,7 @@ class OpenRouterClient:
         base_url: str = "https://openrouter.ai/api/v1",
         provider_whitelist: list[str] | None = None,
         models_per_provider: int = 3,
+        model_include_list: list[str] | None = None,
     ):
         """Initialize the OpenRouter client.
 
@@ -32,10 +33,12 @@ class OpenRouterClient:
             base_url: OpenRouter API base URL.
             provider_whitelist: List of provider IDs to include. If None, include all.
             models_per_provider: Maximum number of models to keep per provider.
+            model_include_list: List of model IDs to always include (e.g., thinking models).
         """
         self.base_url = base_url.rstrip("/")
         self.provider_whitelist = provider_whitelist
         self.models_per_provider = models_per_provider
+        self.model_include_list = set(model_include_list) if model_include_list else set()
 
     async def fetch_models(self) -> ModelsData:
         """Fetch models from OpenRouter API.
@@ -90,6 +93,7 @@ class OpenRouterClient:
         3. Group by provider
         4. Sort each group by created timestamp (newest first)
         5. Keep only top N per provider
+        6. Always include models from model_include_list
 
         Args:
             raw_models: Raw model data from OpenRouter API.
@@ -97,6 +101,9 @@ class OpenRouterClient:
         Returns:
             List of processed ModelInfo objects.
         """
+        # Build a lookup of all models by ID (for include_list)
+        all_models_by_id: dict[str, ModelInfo] = {}
+
         # Group models by provider
         by_provider: dict[str, list[ModelInfo]] = defaultdict(list)
 
@@ -106,10 +113,6 @@ class OpenRouterClient:
                 continue
 
             provider = model_id.split("/")[0]
-
-            # Filter by whitelist if configured
-            if self.provider_whitelist and provider not in self.provider_whitelist:
-                continue
 
             # Extract pricing
             pricing_data = raw.get("pricing", {})
@@ -139,11 +142,19 @@ class OpenRouterClient:
                 created=raw.get("created"),
             )
 
+            # Store all models for include_list lookup
+            all_models_by_id[model_id] = model
+
+            # Filter by whitelist if configured (for top N selection)
+            if self.provider_whitelist and provider not in self.provider_whitelist:
+                continue
+
             by_provider[provider].append(model)
 
         # Sort each provider's models by created timestamp (newest first)
         # and keep only top N
         result: list[ModelInfo] = []
+        included_ids: set[str] = set()
 
         for provider in sorted(by_provider.keys()):
             models = by_provider[provider]
@@ -154,6 +165,7 @@ class OpenRouterClient:
             # Keep only top N
             top_models = models[: self.models_per_provider]
             result.extend(top_models)
+            included_ids.update(m.id for m in top_models)
 
             logger.debug(
                 "Provider models",
@@ -162,5 +174,14 @@ class OpenRouterClient:
                 kept=len(top_models),
                 models=[m.id for m in top_models],
             )
+
+        # Add any include_list models that weren't already included
+        for model_id in self.model_include_list:
+            if model_id not in included_ids and model_id in all_models_by_id:
+                result.append(all_models_by_id[model_id])
+                logger.debug("Added include_list model", model_id=model_id)
+
+        # Sort final result by provider, then by name
+        result.sort(key=lambda m: (m.provider, m.name))
 
         return result

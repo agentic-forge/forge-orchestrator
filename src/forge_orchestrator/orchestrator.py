@@ -80,6 +80,7 @@ class AgentOrchestrator:
             base_url=settings.openrouter_base_url,
             provider_whitelist=settings.provider_whitelist,
             models_per_provider=settings.models_per_provider,
+            model_include_list=settings.model_include_list,
         )
 
     async def initialize(self) -> None:
@@ -238,6 +239,10 @@ class AgentOrchestrator:
 
         Stateless - all context is provided in the request.
 
+        Note: When tools are available, uses non-streaming mode due to a pydantic-ai
+        bug where streaming methods don't properly execute MCP tools. The response
+        is chunked into token events to simulate streaming feel.
+
         Args:
             user_message: The user's message.
             messages: Previous conversation history.
@@ -282,25 +287,51 @@ class AgentOrchestrator:
             system_prompt,
         )
 
-        # Track state for streaming
+        # Use non-streaming when tools are available (pydantic-ai streaming + MCP bug)
+        if toolsets:
+            logger.info("Using non-streaming mode (tools available)")
+            async for event in self._run_non_streaming(
+                agent, user_message, message_history
+            ):
+                yield event
+            return
+
+        # Use streaming mode when no tools (pure text generation)
+        async for event in self._run_streaming(
+            agent, user_message, message_history
+        ):
+            yield event
+
+    async def _run_streaming(
+        self,
+        agent: Agent,
+        user_message: str,
+        message_history: list[ModelMessage],
+    ) -> AsyncIterator[SSEEvent]:
+        """Run agent in streaming mode (no tools).
+
+        Args:
+            agent: The Pydantic AI agent.
+            user_message: The user's message.
+            message_history: Conversation history.
+
+        Yields:
+            SSE events for the response.
+        """
         cumulative_text = ""
         last_ping = time.time()
 
         try:
             async with agent:
-                logger.info("Agent context entered, starting run_stream")
+                logger.info("Agent context entered, starting streaming run")
 
-                # Track tool calls in progress
-                active_tool_calls: dict[str, float] = {}  # tool_call_id -> start_time
-
-                # Use run_stream with stream() for full event access including tools
                 async with agent.run_stream(
                     user_message,
                     message_history=message_history if message_history else None,
                 ) as result:
                     logger.info("run_stream started")
 
-                    # Stream text - this iterates the agent loop including tool calls
+                    # Stream text tokens
                     async for delta in result.stream_text(delta=True):
                         if delta:
                             cumulative_text += delta
@@ -312,49 +343,20 @@ class AgentOrchestrator:
                             yield PingEvent(timestamp=int(now))
                             last_ping = now
 
-                    logger.info("Streaming complete", cumulative_text_len=len(cumulative_text))
-
-                    # Extract tool calls and results from conversation history
+                    # Extract thinking from message history
+                    cumulative_thinking = ""
                     for msg in result.new_messages():
-                        if hasattr(msg, 'parts'):
-                            for part in msg.parts:
-                                if isinstance(part, ToolCallPart):
-                                    logger.info(
-                                        "Tool call in history",
-                                        tool_name=part.tool_name,
-                                        tool_call_id=part.tool_call_id,
-                                    )
-                                    try:
-                                        args = json.loads(part.args) if isinstance(part.args, str) else part.args
-                                    except Exception:
-                                        args = {"raw": part.args}
+                        thinking = getattr(msg, 'thinking', None)
+                        if thinking:
+                            cumulative_thinking = str(thinking)
+                            yield ThinkingEvent(content=cumulative_thinking, cumulative=cumulative_thinking)
+                            break
 
-                                    yield ToolCallEvent(
-                                        id=part.tool_call_id or f"tc_{uuid.uuid4().hex[:8]}",
-                                        tool_name=part.tool_name,
-                                        arguments=args,
-                                        status="complete",
-                                    )
-
-                                elif isinstance(part, ToolReturnPart):
-                                    logger.info(
-                                        "Tool result in history",
-                                        tool_name=part.tool_name,
-                                        tool_call_id=part.tool_call_id,
-                                        content_preview=str(part.content)[:100],
-                                    )
-                                    try:
-                                        result_content = json.loads(part.content) if isinstance(part.content, str) else part.content
-                                    except Exception:
-                                        result_content = part.content
-
-                                    is_error = "not executed" in str(part.content).lower() if part.content else False
-                                    yield ToolResultEvent(
-                                        tool_call_id=part.tool_call_id or "unknown",
-                                        result=result_content,
-                                        is_error=is_error,
-                                        latency_ms=0,
-                                    )
+                    logger.info(
+                        "Streaming complete",
+                        cumulative_text_len=len(cumulative_text),
+                        cumulative_thinking_len=len(cumulative_thinking),
+                    )
 
                     # Get usage stats
                     usage = None
@@ -371,7 +373,133 @@ class AgentOrchestrator:
         except asyncio.CancelledError:
             yield ErrorEvent(code="CANCELLED", message="Generation cancelled", retryable=False)
         except Exception as e:
-            logger.exception("Error during agent run")
+            logger.exception("Error during streaming run")
+            yield ErrorEvent(
+                code="MODEL_ERROR",
+                message=str(e),
+                retryable=True,
+            )
+
+    async def _run_non_streaming(
+        self,
+        agent: Agent,
+        user_message: str,
+        message_history: list[ModelMessage],
+    ) -> AsyncIterator[SSEEvent]:
+        """Run agent in non-streaming mode (with tools).
+
+        This is a workaround for pydantic-ai bug where streaming doesn't
+        properly execute MCP tools. Non-streaming mode works correctly.
+
+        Args:
+            agent: The Pydantic AI agent.
+            user_message: The user's message.
+            message_history: Conversation history.
+
+        Yields:
+            SSE events for the response.
+        """
+        try:
+            async with agent:
+                logger.info("Agent context entered, starting non-streaming run")
+
+                # Run synchronously - this properly executes tool calls
+                result = await agent.run(
+                    user_message,
+                    message_history=message_history if message_history else None,
+                )
+
+                logger.info("Non-streaming run complete")
+
+                # Extract thinking from new messages
+                cumulative_thinking = ""
+                for msg in result.new_messages():
+                    thinking = getattr(msg, 'thinking', None)
+                    if thinking:
+                        cumulative_thinking = str(thinking)
+                        yield ThinkingEvent(content=cumulative_thinking, cumulative=cumulative_thinking)
+                        break
+
+                # Extract tool calls and results from message history
+                for msg in result.new_messages():
+                    if hasattr(msg, 'parts'):
+                        for part in msg.parts:
+                            if isinstance(part, ToolCallPart):
+                                logger.info(
+                                    "Tool call executed",
+                                    tool_name=part.tool_name,
+                                    tool_call_id=part.tool_call_id,
+                                )
+                                try:
+                                    args = json.loads(part.args) if isinstance(part.args, str) else part.args
+                                except Exception:
+                                    args = {"raw": part.args}
+
+                                yield ToolCallEvent(
+                                    id=part.tool_call_id or f"tc_{uuid.uuid4().hex[:8]}",
+                                    tool_name=part.tool_name,
+                                    arguments=args if isinstance(args, dict) else {},
+                                    status="complete",
+                                )
+
+                            elif isinstance(part, ToolReturnPart):
+                                logger.info(
+                                    "Tool result received",
+                                    tool_name=part.tool_name,
+                                    tool_call_id=part.tool_call_id,
+                                    content_preview=str(part.content)[:100],
+                                )
+                                try:
+                                    result_content = json.loads(part.content) if isinstance(part.content, str) else part.content
+                                except Exception:
+                                    result_content = part.content
+
+                                # Check for error - look for is_error attribute on the content object
+                                is_error = bool(getattr(part.content, 'is_error', False))
+
+                                yield ToolResultEvent(
+                                    tool_call_id=part.tool_call_id or "unknown",
+                                    result=result_content,
+                                    is_error=is_error,
+                                    latency_ms=0,
+                                )
+
+                # Get the final response text
+                response_text = str(result.output) if result.output else ""
+
+                # Chunk response into tokens to simulate streaming feel
+                cumulative_text = ""
+                words = response_text.split()
+                for i, word in enumerate(words):
+                    # Add space before word (except first)
+                    token = f" {word}" if i > 0 else word
+                    cumulative_text += token
+                    yield TokenEvent(token=token, cumulative=cumulative_text)
+                    # Small delay to simulate streaming
+                    await asyncio.sleep(0.01)
+
+                logger.info(
+                    "Response chunking complete",
+                    response_len=len(response_text),
+                    thinking_len=len(cumulative_thinking),
+                )
+
+                # Get usage stats
+                usage = None
+                if hasattr(result, "usage") and result.usage:
+                    usage_data = result.usage()
+                    if usage_data:
+                        usage = TokenUsage(
+                            prompt_tokens=usage_data.input_tokens or 0,
+                            completion_tokens=usage_data.output_tokens or 0,
+                        )
+
+                yield CompleteEvent(response=response_text, usage=usage)
+
+        except asyncio.CancelledError:
+            yield ErrorEvent(code="CANCELLED", message="Generation cancelled", retryable=False)
+        except Exception as e:
+            logger.exception("Error during non-streaming run")
             yield ErrorEvent(
                 code="MODEL_ERROR",
                 message=str(e),
@@ -438,6 +566,7 @@ class AgentOrchestrator:
 
         Pydantic AI uses format like 'openai:gpt-4' or 'anthropic:claude-sonnet-4-0'.
         OpenRouter models come as 'anthropic/claude-sonnet-4' and need conversion.
+        Some OpenRouter models have suffixes like ':thinking' or ':free'.
 
         Args:
             model: The model name (OpenRouter format).
@@ -445,10 +574,14 @@ class AgentOrchestrator:
         Returns:
             Model string in Pydantic AI format.
         """
-        # If already in Pydantic AI format, return as-is
-        if ":" in model:
+        # Known pydantic-ai provider prefixes
+        pydantic_providers = ["openrouter:", "openai:", "anthropic:", "google:", "groq:", "mistral:"]
+
+        # If already in Pydantic AI format (starts with known provider), return as-is
+        if any(model.startswith(p) for p in pydantic_providers):
             return model
 
         # Convert OpenRouter format to Pydantic AI format with OpenRouter provider
         # e.g., "anthropic/claude-sonnet-4" -> "openrouter:anthropic/claude-sonnet-4"
+        # e.g., "anthropic/claude-3.7-sonnet:thinking" -> "openrouter:anthropic/claude-3.7-sonnet:thinking"
         return f"openrouter:{model}"

@@ -69,6 +69,16 @@ class Settings(BaseSettings):
     ]
     models_per_provider: int = 3
 
+    # Models to always include (thinking/reasoning models from each provider)
+    model_include_list: list[str] = [
+        "anthropic/claude-3.7-sonnet:thinking",  # Claude with thinking mode
+        "openai/o1",  # OpenAI reasoning model
+        "openai/o1-pro",  # OpenAI reasoning model (advanced)
+        "deepseek/deepseek-r1",  # DeepSeek R1 reasoning model
+        "qwen/qwq-32b",  # Qwen QwQ reasoning model
+        "moonshotai/kimi-k2-thinking",  # Moonshot thinking model
+    ]
+
     # Features
     mock_llm: bool = False  # For testing without real LLM
     show_thinking: bool = True  # Stream thinking tokens if model supports
