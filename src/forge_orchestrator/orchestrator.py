@@ -97,7 +97,11 @@ class AgentOrchestrator:
 
         try:
             if await self._armory_client.ping():
-                self._mcp_server = MCPServerStreamableHTTP(self.settings.armory_url)
+                # Pass caller header so Armory knows requests come from orchestrator
+                self._mcp_server = MCPServerStreamableHTTP(
+                    self.settings.armory_url,
+                    headers={"X-Caller": "forge-orchestrator"},
+                )
                 self._armory_available = True
                 logger.info("Connected to Armory", armory_url=self.settings.armory_url)
             else:
@@ -127,7 +131,10 @@ class AgentOrchestrator:
 
         try:
             if await self._armory_client.ping():
-                self._mcp_server = MCPServerStreamableHTTP(self.settings.armory_url)
+                self._mcp_server = MCPServerStreamableHTTP(
+                    self.settings.armory_url,
+                    headers={"X-Caller": "forge-orchestrator"},
+                )
                 self._armory_available = True
                 return await self._armory_client.list_tools()
         except Exception as e:
@@ -562,26 +569,108 @@ class AgentOrchestrator:
         )
 
     def _get_model_string(self, model: str) -> str:
-        """Convert model name to Pydantic AI format.
+        """Convert model name to Pydantic AI format with provider routing.
 
-        Pydantic AI uses format like 'openai:gpt-4' or 'anthropic:claude-sonnet-4-0'.
-        OpenRouter models come as 'anthropic/claude-sonnet-4' and need conversion.
-        Some OpenRouter models have suffixes like ':thinking' or ':free'.
+        Supports multiple providers:
+        - openrouter: OpenRouter API (default for slash-format models)
+        - openai: Direct OpenAI API
+        - anthropic: Direct Anthropic API
+        - google-gla: Direct Google Gemini API
+
+        Model format examples:
+        - "openrouter:anthropic/claude-sonnet-4" - Explicit OpenRouter
+        - "openai:gpt-4o" - Direct OpenAI
+        - "anthropic:claude-sonnet-4-20250514" - Direct Anthropic
+        - "google-gla:gemini-2.0-flash" - Direct Google
+        - "anthropic/claude-sonnet-4" - OpenRouter format (backwards compat)
+        - "gpt-4o" - Auto-detect based on model name patterns
 
         Args:
-            model: The model name (OpenRouter format).
+            model: The model name.
 
         Returns:
             Model string in Pydantic AI format.
         """
         # Known pydantic-ai provider prefixes
-        pydantic_providers = ["openrouter:", "openai:", "anthropic:", "google:", "groq:", "mistral:"]
+        pydantic_providers = [
+            "openrouter:",
+            "openai:",
+            "anthropic:",
+            "google-gla:",
+            "groq:",
+            "mistral:",
+        ]
 
         # If already in Pydantic AI format (starts with known provider), return as-is
         if any(model.startswith(p) for p in pydantic_providers):
             return model
 
-        # Convert OpenRouter format to Pydantic AI format with OpenRouter provider
-        # e.g., "anthropic/claude-sonnet-4" -> "openrouter:anthropic/claude-sonnet-4"
-        # e.g., "anthropic/claude-3.7-sonnet:thinking" -> "openrouter:anthropic/claude-3.7-sonnet:thinking"
+        # Check for OpenRouter slash format (e.g., "anthropic/claude-sonnet-4")
+        if "/" in model:
+            # This is OpenRouter format - route through OpenRouter
+            return f"openrouter:{model}"
+
+        # Auto-detect provider based on model name patterns
+        provider = self._detect_provider_from_model(model)
+        if provider:
+            return f"{provider}:{model}"
+
+        # Default to OpenRouter for unknown models
+        logger.warning(
+            "Could not detect provider for model, defaulting to OpenRouter",
+            model=model,
+        )
         return f"openrouter:{model}"
+
+    def _detect_provider_from_model(self, model: str) -> str | None:
+        """Detect the provider based on model name patterns.
+
+        Only returns a provider if the corresponding API key is configured.
+
+        Args:
+            model: The model name without provider prefix.
+
+        Returns:
+            Provider prefix or None if not detected.
+        """
+        # Model name patterns for each provider
+        openai_patterns = ["gpt-", "o1", "o3", "chatgpt", "davinci", "curie", "babbage", "ada"]
+        anthropic_patterns = ["claude"]
+        google_patterns = ["gemini", "palm", "bard"]
+
+        model_lower = model.lower()
+
+        # Check OpenAI patterns
+        if any(pattern in model_lower for pattern in openai_patterns):
+            if self.settings.openai_api_key:
+                return "openai"
+            elif self.settings.openrouter_api_key:
+                logger.info("OpenAI model requested but no OPENAI_API_KEY, using OpenRouter")
+                return None  # Will fall back to OpenRouter
+            else:
+                logger.warning("OpenAI model requested but no API key available")
+                return "openai"  # Will fail with clear error
+
+        # Check Anthropic patterns
+        if any(pattern in model_lower for pattern in anthropic_patterns):
+            if self.settings.anthropic_api_key:
+                return "anthropic"
+            elif self.settings.openrouter_api_key:
+                logger.info("Anthropic model requested but no ANTHROPIC_API_KEY, using OpenRouter")
+                return None  # Will fall back to OpenRouter
+            else:
+                logger.warning("Anthropic model requested but no API key available")
+                return "anthropic"  # Will fail with clear error
+
+        # Check Google patterns
+        if any(pattern in model_lower for pattern in google_patterns):
+            if self.settings.gemini_api_key:
+                return "google-gla"
+            elif self.settings.openrouter_api_key:
+                logger.info("Google model requested but no GEMINI_API_KEY, using OpenRouter")
+                return None  # Will fall back to OpenRouter
+            else:
+                logger.warning("Google model requested but no API key available")
+                return "google-gla"  # Will fail with clear error
+
+        return None

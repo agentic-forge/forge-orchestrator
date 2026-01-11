@@ -54,17 +54,38 @@ def info() -> None:
     console.print(f"  Armory URL: {settings.armory_url}")
     console.print(f"  Default Model: {settings.default_model}")
     console.print(f"  Server: {settings.host}:{settings.port}")
-    console.print(f"  Conversations Dir: {settings.conversations_dir}")
     console.print(f"  Mock LLM Mode: {settings.mock_llm}")
     console.print(f"  Show Thinking: {settings.show_thinking}")
     console.print(f"  Heartbeat Interval: {settings.heartbeat_interval}s")
     console.print(f"  Tool Timeout Warning: {settings.tool_timeout_warning}s")
 
-    # Check API key
+    # Check API keys
+    console.print()
+    console.print("[bold]LLM Providers:[/bold]")
     if settings.openrouter_api_key:
-        console.print("  OpenRouter API Key: [green]configured[/green]")
+        console.print("  OpenRouter: [green]configured[/green]")
     else:
-        console.print("  OpenRouter API Key: [yellow]not configured[/yellow]")
+        console.print("  OpenRouter: [dim]not configured[/dim]")
+
+    if settings.openai_api_key:
+        console.print("  OpenAI: [green]configured[/green]")
+    else:
+        console.print("  OpenAI: [dim]not configured[/dim]")
+
+    if settings.anthropic_api_key:
+        console.print("  Anthropic: [green]configured[/green]")
+    else:
+        console.print("  Anthropic: [dim]not configured[/dim]")
+
+    if settings.gemini_api_key:
+        console.print("  Google Gemini: [green]configured[/green]")
+    else:
+        console.print("  Google Gemini: [dim]not configured[/dim]")
+
+    if not settings.has_any_api_key:
+        console.print()
+        console.print("[red]Warning: No LLM API keys configured![/red]")
+        console.print("Set at least one of: OPENROUTER_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY")
 
 
 @app.command()

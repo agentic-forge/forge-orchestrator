@@ -49,7 +49,13 @@ class Settings(BaseSettings):
 
     # LLM settings
     default_model: str = "anthropic/claude-sonnet-4"
+
+    # API keys for LLM providers (at least one required)
+    # These are loaded without ORCHESTRATOR_ prefix for convenience
     openrouter_api_key: SecretStr | None = None
+    openai_api_key: SecretStr | None = None
+    anthropic_api_key: SecretStr | None = None
+    gemini_api_key: SecretStr | None = None
 
     # Server settings
     host: str = "0.0.0.0"
@@ -92,6 +98,25 @@ class Settings(BaseSettings):
         """OpenRouter API base URL."""
         return "https://openrouter.ai/api/v1"
 
+    @property
+    def available_providers(self) -> list[str]:
+        """List of providers with configured API keys."""
+        providers = []
+        if self.openrouter_api_key:
+            providers.append("openrouter")
+        if self.openai_api_key:
+            providers.append("openai")
+        if self.anthropic_api_key:
+            providers.append("anthropic")
+        if self.gemini_api_key:
+            providers.append("google-gla")
+        return providers
+
+    @property
+    def has_any_api_key(self) -> bool:
+        """Check if at least one API key is configured."""
+        return bool(self.available_providers)
+
 
 # Override the env_prefix for openrouter_api_key to have no prefix
 class SettingsWithApiKey(Settings):
@@ -122,11 +147,18 @@ class SettingsWithApiKey(Settings):
             def prepare_field_value(
                 self, field_name: str, field, value, value_is_complex
             ):
-                # Handle openrouter_api_key specially - look for OPENROUTER_API_KEY
-                if field_name == "openrouter_api_key" and value is None:
-                    import os
+                import os
 
-                    return os.environ.get("OPENROUTER_API_KEY")
+                # Handle API keys specially - look for them without ORCHESTRATOR_ prefix
+                api_key_mappings = {
+                    "openrouter_api_key": "OPENROUTER_API_KEY",
+                    "openai_api_key": "OPENAI_API_KEY",
+                    "anthropic_api_key": "ANTHROPIC_API_KEY",
+                    "gemini_api_key": "GEMINI_API_KEY",
+                }
+
+                if field_name in api_key_mappings and value is None:
+                    return os.environ.get(api_key_mappings[field_name])
                 return super().prepare_field_value(field_name, field, value, value_is_complex)
 
         return (
