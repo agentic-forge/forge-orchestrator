@@ -12,6 +12,12 @@ from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
 from forge_orchestrator.logging import configure_logging, get_logger
+from forge_orchestrator.models.api import (
+    AddModelRequest,
+    FetchModelsRequest,
+    UpdateModelRequest,
+    UpdateProviderRequest,
+)
 from forge_orchestrator.models.messages import get_event_type
 from forge_orchestrator.orchestrator import AgentOrchestrator
 from forge_orchestrator.settings import settings
@@ -235,6 +241,274 @@ async def refresh_models(request: Request) -> dict[str, Any]:
             status_code=502,
             detail=f"Failed to fetch models from OpenRouter: {e}",
         ) from e
+
+
+# ============================================================================
+# New Model Management Endpoints
+# ============================================================================
+
+
+@app.get("/providers")
+async def list_providers(request: Request) -> dict[str, Any]:
+    """List available providers and their configuration status."""
+    from forge_orchestrator.models import ProviderResponse, ProvidersResponse
+    from forge_orchestrator.providers import provider_registry
+
+    orchestrator: AgentOrchestrator = request.app.state.orchestrator
+
+    # Configure registry with API keys from settings
+    provider_registry.configure_from_settings(orchestrator._settings)
+
+    providers = []
+    for provider_id in provider_registry.get_provider_ids():
+        provider = provider_registry.get(provider_id)
+        if not provider:
+            continue
+
+        # Get model count from config
+        config = await orchestrator.get_models_config()
+        provider_config = config.get_provider(provider_id)
+        model_count = len(provider_config.models) if provider_config else 0
+
+        providers.append(ProviderResponse(
+            id=provider_id,
+            name=provider.display_name,
+            configured=provider.is_configured,
+            has_api=provider.has_api,
+            model_count=model_count,
+            enabled=provider_config.enabled if provider_config else True,
+        ))
+
+    return ProvidersResponse(providers=providers).model_dump(mode="json")
+
+
+@app.get("/models/grouped")
+async def list_models_grouped(request: Request) -> dict[str, Any]:
+    """List all models grouped by provider and category.
+
+    Returns models organized for the management modal UI.
+    """
+    from forge_orchestrator.models import GroupedModelsResponse, ModelReference
+
+    orchestrator: AgentOrchestrator = request.app.state.orchestrator
+
+    config = await orchestrator.get_models_config()
+
+    # Build grouped structure
+    providers_data: dict[str, dict[str, list]] = {}
+
+    for provider_id, provider_config in config._data.providers.items():
+        if not provider_config.enabled:
+            continue
+
+        categories: dict[str, list] = {"chat": [], "embedding": [], "other": []}
+
+        for model in provider_config.models.values():
+            category = model.category
+            if category not in categories:
+                category = "other"
+            categories[category].append(model)
+
+        # Sort each category by display name
+        for cat_models in categories.values():
+            cat_models.sort(key=lambda m: m.display_name.lower())
+
+        providers_data[provider_id] = categories
+
+    # Build favorites list
+    favorites = [
+        ModelReference(provider=provider_id, model_id=model.id)
+        for provider_id, model in config.get_favorites()
+    ]
+
+    # Build recent list
+    recent = [
+        ModelReference(provider=r.provider, model_id=r.model_id)
+        for r in config.get_recent()
+    ]
+
+    # Get default model
+    default = config.get_default_model()
+    default_ref = ModelReference(provider=default.provider, model_id=default.model_id) if default else None
+
+    return GroupedModelsResponse(
+        providers=providers_data,
+        favorites=favorites,
+        recent=recent,
+        default_model=default_ref,
+    ).model_dump(mode="json")
+
+
+@app.post("/models/fetch")
+async def fetch_models_from_provider(
+    request: Request,
+    body: FetchModelsRequest,
+) -> dict[str, Any]:
+    """Fetch models from a provider's API.
+
+    Only works for providers with has_api=True (OpenAI, OpenRouter).
+    """
+    from forge_orchestrator.models import DeprecatedModel, FetchModelsRequest, FetchModelsResponse
+    from forge_orchestrator.providers import ProviderError, provider_registry
+
+    orchestrator: AgentOrchestrator = request.app.state.orchestrator
+
+    # Configure registry
+    provider_registry.configure_from_settings(orchestrator._settings)
+
+    provider = provider_registry.get(body.provider)
+    if not provider:
+        raise HTTPException(status_code=404, detail=f"Provider not found: {body.provider}")
+
+    if not provider.has_api:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Provider {body.provider} does not support API fetching. Use suggestions for manual addition.",
+        )
+
+    if not provider.is_configured:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Provider {body.provider} is not configured. Add API key to .env file.",
+        )
+
+    try:
+        models = await provider.fetch_models()
+    except ProviderError as e:
+        logger.error("Failed to fetch models", provider=body.provider, error=str(e))
+        raise HTTPException(
+            status_code=502 if e.retryable else 400,
+            detail=str(e),
+        ) from e
+
+    # Save to config
+    config = await orchestrator.get_models_config()
+    added, updated, deprecated_ids = await config.set_models_from_api(body.provider, models)
+
+    deprecated = [DeprecatedModel(id=mid) for mid in deprecated_ids]
+
+    return FetchModelsResponse(
+        provider=body.provider,
+        models_added=added,
+        models_updated=updated,
+        deprecated=deprecated,
+    ).model_dump(mode="json")
+
+
+@app.post("/models")
+async def add_model(
+    request: Request,
+    body: AddModelRequest,
+) -> dict[str, Any]:
+    """Add a model manually."""
+    from forge_orchestrator.models import AddModelResponse
+
+    orchestrator: AgentOrchestrator = request.app.state.orchestrator
+
+    config = await orchestrator.get_models_config()
+    model = await config.add_model(
+        provider_id=body.provider,
+        model_id=body.model_id,
+        display_name=body.display_name,
+        source="manual",
+        capabilities=body.capabilities,
+    )
+
+    return AddModelResponse(model=model).model_dump(mode="json")
+
+
+@app.put("/models/{provider}/{model_id:path}")
+async def update_model(
+    request: Request,
+    provider: str,
+    model_id: str,
+    body: UpdateModelRequest,
+) -> dict[str, Any]:
+    """Update a model's properties (favorite, display name, capabilities)."""
+    orchestrator: AgentOrchestrator = request.app.state.orchestrator
+
+    config = await orchestrator.get_models_config()
+    model = await config.update_model(
+        provider_id=provider,
+        model_id=model_id,
+        favorited=body.favorited,
+        display_name=body.display_name,
+        capabilities=body.capabilities,
+    )
+
+    if model is None:
+        raise HTTPException(status_code=404, detail=f"Model not found: {provider}/{model_id}")
+
+    return {"status": "updated", "model": model.model_dump(mode="json")}
+
+
+@app.delete("/models/{provider}/{model_id:path}")
+async def delete_model(
+    request: Request,
+    provider: str,
+    model_id: str,
+) -> dict[str, Any]:
+    """Remove a model from configuration."""
+    orchestrator: AgentOrchestrator = request.app.state.orchestrator
+
+    config = await orchestrator.get_models_config()
+    removed = await config.remove_model(provider, model_id)
+
+    if not removed:
+        raise HTTPException(status_code=404, detail=f"Model not found: {provider}/{model_id}")
+
+    return {"status": "deleted", "provider": provider, "model_id": model_id}
+
+
+@app.put("/providers/{provider_id}")
+async def update_provider(
+    request: Request,
+    provider_id: str,
+    body: UpdateProviderRequest,
+) -> dict[str, Any]:
+    """Enable or disable a provider."""
+    orchestrator: AgentOrchestrator = request.app.state.orchestrator
+
+    config = await orchestrator.get_models_config()
+    success = await config.set_provider_enabled(provider_id, body.enabled)
+
+    if not success:
+        raise HTTPException(status_code=404, detail=f"Provider not found: {provider_id}")
+
+    return {"status": "updated", "provider": provider_id, "enabled": body.enabled}
+
+
+@app.get("/models/suggestions/{provider_id}")
+async def get_suggestions(
+    request: Request,
+    provider_id: str,
+) -> dict[str, Any]:
+    """Get model suggestions for a provider (for manual addition)."""
+    from forge_orchestrator.models import ModelSuggestionResponse, SuggestionsResponse
+    from forge_orchestrator.providers import provider_registry
+
+    orchestrator: AgentOrchestrator = request.app.state.orchestrator
+
+    # Configure registry
+    provider_registry.configure_from_settings(orchestrator._settings)
+
+    provider = provider_registry.get(provider_id)
+    if not provider:
+        raise HTTPException(status_code=404, detail=f"Provider not found: {provider_id}")
+
+    suggestions = provider.get_suggestions()
+
+    return SuggestionsResponse(
+        provider=provider_id,
+        suggestions=[
+            ModelSuggestionResponse(
+                id=s.id,
+                display_name=s.display_name,
+                recommended=s.recommended,
+            )
+            for s in suggestions
+        ],
+    ).model_dump(mode="json")
 
 
 # ============================================================================

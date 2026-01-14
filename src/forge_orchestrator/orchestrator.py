@@ -32,6 +32,7 @@ from forge_orchestrator.models import (
     ToolResultEvent,
 )
 from forge_orchestrator.models_cache import ModelsCache
+from forge_orchestrator.models_config import ModelsConfig
 from forge_orchestrator.openrouter_client import OpenRouterClient
 
 if TYPE_CHECKING:
@@ -70,11 +71,12 @@ class AgentOrchestrator:
             settings: Application settings.
         """
         self.settings = settings
+        self._settings = settings  # Alias for API endpoint access
         self._mcp_server: MCPServerStreamableHTTP | None = None
         self._armory_client: ArmoryClient | None = None
         self._armory_available = False
 
-        # Models cache and OpenRouter client
+        # Models cache and OpenRouter client (legacy)
         self._models_cache = ModelsCache(settings.models_cache_file)
         self._openrouter_client = OpenRouterClient(
             base_url=settings.openrouter_base_url,
@@ -83,11 +85,17 @@ class AgentOrchestrator:
             model_include_list=settings.model_include_list,
         )
 
+        # New models config storage
+        self._models_config = ModelsConfig(settings.models_config_file)
+
     async def initialize(self) -> None:
         """Initialize the orchestrator and connect to Armory."""
         if self.settings.mock_llm:
             logger.info("Running in mock LLM mode")
             return
+
+        # Run migration from legacy cache if needed
+        await self._migrate_models_if_needed()
 
         # Try to connect to Armory
         self._armory_client = ArmoryClient(
@@ -119,6 +127,25 @@ class AgentOrchestrator:
     async def shutdown(self) -> None:
         """Shutdown the orchestrator."""
         logger.info("Orchestrator shutdown")
+
+    async def _migrate_models_if_needed(self) -> None:
+        """Migrate from legacy models cache if needed."""
+        # Check if new config exists
+        if await self._models_config.exists():
+            logger.debug("New models config exists, skipping migration")
+            return
+
+        # Check if legacy cache exists
+        legacy_cache = self.settings.models_cache_file
+        if not legacy_cache.exists():
+            logger.debug("No legacy cache to migrate")
+            return
+
+        # Perform migration
+        logger.info("Migrating from legacy models cache...")
+        imported = await self._models_config.migrate_from_legacy_cache(legacy_cache)
+        if imported > 0:
+            logger.info("Migration complete", models_imported=imported)
 
     async def refresh_tools(self) -> list[dict[str, Any]]:
         """Refresh tools from Armory.
@@ -186,6 +213,17 @@ class AgentOrchestrator:
         )
 
         return models_data
+
+    async def get_models_config(self) -> ModelsConfig:
+        """Get the models config storage.
+
+        Loads config from file if not already loaded.
+
+        Returns:
+            The ModelsConfig instance.
+        """
+        await self._models_config.load()
+        return self._models_config
 
     def _build_message_history(
         self,

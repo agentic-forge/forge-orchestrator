@@ -62,7 +62,8 @@ class Settings(BaseSettings):
     port: int = 8001
 
     # Storage (only for caching, not conversation persistence)
-    models_cache_file: Path = Path.home() / ".forge" / "models_cache.json"
+    models_cache_file: Path = Path.home() / ".forge" / "models_cache.json"  # Legacy
+    models_config_file: Path = Path.home() / ".forge" / "models_config.json"  # New
 
     # Model selection
     provider_whitelist: list[str] = [

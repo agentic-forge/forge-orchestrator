@@ -24,6 +24,31 @@ from forge_orchestrator.models.openrouter import (
     ModelsRefreshResponse,
     ModelsResponse,
 )
+from forge_orchestrator.models.provider import (
+    LastUsedModel,
+    ModelCapabilities,
+    ModelConfig,
+    ModelsConfigData,
+    ModelsConfigSettings,
+    ModelSuggestion,
+    ProviderConfig,
+    RecentModel,
+)
+from forge_orchestrator.models.api import (
+    AddModelRequest,
+    AddModelResponse,
+    DeprecatedModel,
+    FetchModelsRequest,
+    FetchModelsResponse,
+    GroupedModelsResponse,
+    ModelReference,
+    ModelSuggestionResponse,
+    ProviderResponse,
+    ProvidersResponse,
+    SuggestionsResponse,
+    UpdateModelRequest,
+    UpdateProviderRequest,
+)
 
 __all__ = [
     # Conversation models
@@ -41,10 +66,33 @@ __all__ = [
     "ErrorEvent",
     "PingEvent",
     "SSEEvent",
-    # OpenRouter models
+    # OpenRouter models (legacy)
     "ModelInfo",
     "ModelPricing",
     "ModelsData",
     "ModelsResponse",
     "ModelsRefreshResponse",
+    # Provider models (new)
+    "ModelCapabilities",
+    "ModelConfig",
+    "ProviderConfig",
+    "RecentModel",
+    "LastUsedModel",
+    "ModelsConfigSettings",
+    "ModelsConfigData",
+    "ModelSuggestion",
+    # API models (new)
+    "AddModelRequest",
+    "AddModelResponse",
+    "DeprecatedModel",
+    "FetchModelsRequest",
+    "FetchModelsResponse",
+    "GroupedModelsResponse",
+    "ModelReference",
+    "ModelSuggestionResponse",
+    "ProviderResponse",
+    "ProvidersResponse",
+    "SuggestionsResponse",
+    "UpdateModelRequest",
+    "UpdateProviderRequest",
 ]
