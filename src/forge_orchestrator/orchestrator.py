@@ -466,6 +466,9 @@ class AgentOrchestrator:
                         break
 
                 # Extract tool calls and results from message history
+                # Track tool call timestamps for latency calculation
+                tool_call_timestamps: dict[str, Any] = {}
+
                 for msg in result.new_messages():
                     if hasattr(msg, 'parts'):
                         for part in msg.parts:
@@ -480,12 +483,17 @@ class AgentOrchestrator:
                                 except Exception:
                                     args = {"raw": part.args}
 
+                                tool_id = part.tool_call_id or f"tc_{uuid.uuid4().hex[:8]}"
                                 yield ToolCallEvent(
-                                    id=part.tool_call_id or f"tc_{uuid.uuid4().hex[:8]}",
+                                    id=tool_id,
                                     tool_name=part.tool_name,
                                     arguments=args if isinstance(args, dict) else {},
                                     status="complete",
                                 )
+
+                                # Store message timestamp for latency calculation
+                                # ToolCallPart doesn't have timestamp, but parent ModelResponse does
+                                tool_call_timestamps[tool_id] = getattr(msg, 'timestamp', None)
 
                             elif isinstance(part, ToolReturnPart):
                                 logger.info(
@@ -502,11 +510,20 @@ class AgentOrchestrator:
                                 # Check for error - look for is_error attribute on the content object
                                 is_error = bool(getattr(part.content, 'is_error', False))
 
+                                # Calculate latency from timestamps
+                                # ToolReturnPart has its own timestamp field
+                                latency_ms = 0
+                                tool_id = part.tool_call_id or "unknown"
+                                call_timestamp = tool_call_timestamps.get(tool_id)
+                                return_timestamp = part.timestamp
+                                if call_timestamp and return_timestamp:
+                                    latency_ms = int((return_timestamp - call_timestamp).total_seconds() * 1000)
+
                                 yield ToolResultEvent(
-                                    tool_call_id=part.tool_call_id or "unknown",
+                                    tool_call_id=tool_id,
                                     result=result_content,
                                     is_error=is_error,
-                                    latency_ms=0,
+                                    latency_ms=latency_ms,
                                 )
 
                 # Get the final response text
