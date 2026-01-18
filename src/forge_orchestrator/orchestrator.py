@@ -279,6 +279,7 @@ class AgentOrchestrator:
         messages: list[Any] | None = None,
         system_prompt: str | None = None,
         model: str | None = None,
+        enable_tools: bool = True,
     ) -> AsyncIterator[SSEEvent]:
         """Execute agent loop and yield SSE events.
 
@@ -293,6 +294,7 @@ class AgentOrchestrator:
             messages: Previous conversation history.
             system_prompt: Optional system prompt.
             model: Optional model override.
+            enable_tools: Whether to enable tool calling (default: True).
 
         Yields:
             SSE events for the response.
@@ -306,17 +308,20 @@ class AgentOrchestrator:
         # Get model or use default
         actual_model = model or self.settings.default_model
 
-        # Build toolsets
+        # Build toolsets (only if tools are enabled)
         toolsets = []
-        if self._mcp_server and self._armory_available:
+        if enable_tools and self._mcp_server and self._armory_available:
             toolsets.append(self._mcp_server)
             logger.info("MCP toolset added to agent")
-        elif not self._armory_available:
+        elif enable_tools and not self._armory_available:
+            # Only warn if tools were requested but unavailable
             yield ErrorEvent(
                 code="ARMORY_UNAVAILABLE",
                 message="Tools unavailable - Armory connection failed",
                 retryable=True,
             )
+        elif not enable_tools:
+            logger.info("Tool calling disabled by user")
 
         # Create agent
         model_string = self._get_model_string(actual_model)

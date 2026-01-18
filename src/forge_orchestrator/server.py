@@ -53,6 +53,10 @@ class ChatRequest(BaseModel):
         default=None,
         description="Model to use (defaults to server default)",
     )
+    enable_tools: bool = Field(
+        default=True,
+        description="Whether to enable tool calling (default: True)",
+    )
 
 
 class HealthResponse(BaseModel):
@@ -547,6 +551,7 @@ async def chat_stream(
                 messages=body.messages,
                 system_prompt=body.system_prompt,
                 model=body.model,
+                enable_tools=body.enable_tools,
             ):
                 # Get event type and serialize
                 event_type = get_event_type(event)
