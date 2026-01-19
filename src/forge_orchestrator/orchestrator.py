@@ -273,6 +273,44 @@ class AgentOrchestrator:
 
         return result
 
+    def _extract_tool_result_content(self, content: Any) -> Any:
+        """Extract the actual content from a tool result.
+
+        With Armory properly extracting data from CallToolResult objects,
+        pydantic-ai now returns clean data (dict/str/list) in ToolReturnPart.content.
+        This method handles edge cases and ensures consistent output.
+
+        Args:
+            content: The raw content from ToolReturnPart.content
+
+        Returns:
+            Extracted content (dict, str, list, or the original if extraction fails)
+        """
+        # If it's already a simple/clean type, return as-is
+        if isinstance(content, (str, int, float, bool, type(None), dict, list)):
+            return content
+
+        # Handle any remaining CallToolResult-like objects (edge cases)
+        # Check for structured_content first (FastMCP uses snake_case)
+        if hasattr(content, 'structured_content') and content.structured_content is not None:
+            return content.structured_content
+
+        # Check for structuredContent (MCP SDK uses camelCase)
+        if hasattr(content, 'structuredContent') and content.structuredContent is not None:
+            return content.structuredContent
+
+        # Check for content array with TextContent items
+        if hasattr(content, 'content') and isinstance(content.content, list) and content.content:
+            first = content.content[0]
+            if hasattr(first, 'text'):
+                try:
+                    return json.loads(first.text)
+                except (json.JSONDecodeError, TypeError):
+                    return first.text
+
+        # Fallback: convert to string
+        return str(content)
+
     async def run_stream(
         self,
         user_message: str,
@@ -280,6 +318,7 @@ class AgentOrchestrator:
         system_prompt: str | None = None,
         model: str | None = None,
         enable_tools: bool = True,
+        use_toon_format: bool = False,
     ) -> AsyncIterator[SSEEvent]:
         """Execute agent loop and yield SSE events.
 
@@ -295,6 +334,7 @@ class AgentOrchestrator:
             system_prompt: Optional system prompt.
             model: Optional model override.
             enable_tools: Whether to enable tool calling (default: True).
+            use_toon_format: Request TOON format from Armory for tool results.
 
         Yields:
             SSE events for the response.
@@ -310,9 +350,21 @@ class AgentOrchestrator:
 
         # Build toolsets (only if tools are enabled)
         toolsets = []
-        if enable_tools and self._mcp_server and self._armory_available:
-            toolsets.append(self._mcp_server)
-            logger.info("MCP toolset added to agent")
+        if enable_tools and self._armory_available:
+            # Build headers for this request
+            # Note: MCP SDK overwrites Accept header, so we use X-Prefer-Format for TOON
+            headers = {"X-Caller": "forge-orchestrator"}
+            if use_toon_format:
+                headers["X-Prefer-Format"] = "toon"
+                logger.info("TOON format enabled for tool results")
+
+            # Create MCP server with request-specific headers
+            mcp_server = MCPServerStreamableHTTP(
+                self.settings.armory_url,
+                headers=headers,
+            )
+            toolsets.append(mcp_server)
+            logger.info("MCP toolset added to agent", use_toon=use_toon_format)
         elif enable_tools and not self._armory_available:
             # Only warn if tools were requested but unavailable
             yield ErrorEvent(
@@ -505,15 +557,19 @@ class AgentOrchestrator:
                                     "Tool result received",
                                     tool_name=part.tool_name,
                                     tool_call_id=part.tool_call_id,
-                                    content_preview=str(part.content)[:100],
                                 )
-                                try:
-                                    result_content = json.loads(part.content) if isinstance(part.content, str) else part.content
-                                except Exception:
-                                    result_content = part.content
 
-                                # Check for error - look for is_error attribute on the content object
-                                is_error = bool(getattr(part.content, 'is_error', False))
+                                # Extract tool result content
+                                result_content = self._extract_tool_result_content(part.content)
+
+                                # Check for error - content might be dict or have is_error attribute
+                                is_error = False
+                                if isinstance(part.content, dict):
+                                    is_error = part.content.get('is_error', False)
+                                elif hasattr(part.content, 'isError'):
+                                    is_error = bool(part.content.isError)
+                                elif hasattr(part.content, 'is_error'):
+                                    is_error = bool(part.content.is_error)
 
                                 # Calculate latency from timestamps
                                 # ToolReturnPart has its own timestamp field

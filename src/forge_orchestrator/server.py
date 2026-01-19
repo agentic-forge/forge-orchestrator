@@ -57,6 +57,10 @@ class ChatRequest(BaseModel):
         default=True,
         description="Whether to enable tool calling (default: True)",
     )
+    use_toon_format: bool = Field(
+        default=False,
+        description="Request TOON format for tool results (reduces tokens)",
+    )
 
 
 class HealthResponse(BaseModel):
@@ -552,6 +556,7 @@ async def chat_stream(
                 system_prompt=body.system_prompt,
                 model=body.model,
                 enable_tools=body.enable_tools,
+                use_toon_format=body.use_toon_format,
             ):
                 # Get event type and serialize
                 event_type = get_event_type(event)
