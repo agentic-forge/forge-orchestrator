@@ -90,15 +90,20 @@ class ArmoryClient:
         except Exception as e:
             raise ArmoryConnectionError(f"Failed to connect to {self.armory_url}: {e}") from e
 
-    async def list_tools(self) -> list[dict[str, Any]]:
+    async def list_tools(self, url_override: str | None = None) -> list[dict[str, Any]]:
         """List available tools from Armory.
+
+        Args:
+            url_override: Optional URL to use instead of the default armory_url.
+                         Used for RAG mode (/mcp?mode=rag).
 
         Returns:
             List of tools with name, description, and input_schema.
             Tool names are prefixed (e.g., weather__get_forecast).
         """
+        url = url_override or self.armory_url
         try:
-            async with Client(self.armory_url) as client:
+            async with Client(url) as client:
                 tools = await client.list_tools()
                 return [
                     {

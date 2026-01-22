@@ -61,6 +61,10 @@ class ChatRequest(BaseModel):
         default=False,
         description="Request TOON format for tool results (reduces tokens)",
     )
+    use_tool_rag_mode: bool | None = Field(
+        default=None,
+        description="Use Tool RAG mode for semantic tool search. If None, uses server default.",
+    )
 
 
 class HealthResponse(BaseModel):
@@ -155,10 +159,17 @@ async def health(request: Request) -> HealthResponse:
 
 
 @app.get("/tools")
-async def list_tools(request: Request) -> list[dict[str, Any]]:
-    """List available tools from Armory."""
+async def list_tools(
+    request: Request,
+    mode: Annotated[str | None, Query(description="Tool mode: 'rag' for semantic search")] = None,
+) -> list[dict[str, Any]]:
+    """List available tools from Armory.
+
+    With mode=rag, returns only the search_tools meta-tool for semantic search.
+    """
     orchestrator: AgentOrchestrator = request.app.state.orchestrator
-    return await orchestrator.list_tools()
+    use_rag_mode = mode == "rag"
+    return await orchestrator.list_tools(use_rag_mode=use_rag_mode)
 
 
 @app.post("/tools/refresh", response_model=ToolsRefreshResponse)
@@ -557,6 +568,7 @@ async def chat_stream(
                 model=body.model,
                 enable_tools=body.enable_tools,
                 use_toon_format=body.use_toon_format,
+                use_tool_rag_mode=body.use_tool_rag_mode,
             ):
                 # Get event type and serialize
                 event_type = get_event_type(event)
