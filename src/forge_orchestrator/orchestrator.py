@@ -192,6 +192,325 @@ async def fetch_armory_tools(
         return []
 
 
+async def _mcp_initialize_session(
+    client: httpx.AsyncClient,
+    server_url: str,
+    headers: dict[str, str],
+    timeout: float,
+) -> str | None:
+    """Initialize an MCP session and return the session ID.
+
+    Args:
+        client: httpx async client.
+        server_url: The MCP server endpoint URL.
+        headers: Request headers.
+        timeout: Request timeout in seconds.
+
+    Returns:
+        Session ID if server requires sessions, None otherwise.
+    """
+    init_request = {
+        "jsonrpc": "2.0",
+        "id": str(uuid.uuid4()),
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {
+                "name": "forge-orchestrator",
+                "version": "0.1.0",
+            },
+        },
+    }
+
+    response = await client.post(
+        server_url,
+        json=init_request,
+        headers=headers,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+
+    # Get session ID from response header
+    session_id = response.headers.get("mcp-session-id")
+
+    if session_id:
+        # Send initialized notification
+        initialized_notification = {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        }
+        headers_with_session = {**headers, "Mcp-Session-Id": session_id}
+        await client.post(
+            server_url,
+            json=initialized_notification,
+            headers=headers_with_session,
+            timeout=timeout,
+        )
+        logger.debug("MCP session initialized", session_id=session_id)
+
+    return session_id
+
+
+async def fetch_custom_server_tools(
+    server_url: str,
+    server_name: str,
+    api_key: str | None = None,
+    timeout: float = 30.0,
+) -> list[dict[str, Any]]:
+    """Fetch tools from a custom MCP server and prefix names.
+
+    Handles MCP Streamable HTTP protocol including session initialization.
+
+    Args:
+        server_url: The MCP server endpoint URL.
+        server_name: User-friendly name for the server (used as prefix).
+        api_key: Optional API key for authentication.
+        timeout: Request timeout in seconds.
+
+    Returns:
+        List of tool definitions with prefixed names (_serverName__toolName),
+        plus _server_url and _api_key for tool calls.
+    """
+    # MCP Streamable HTTP transport requires specific headers
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        # First, try to initialize a session (some servers require this)
+        session_id = None
+        try:
+            session_id = await _mcp_initialize_session(client, server_url, headers, timeout)
+        except httpx.HTTPStatusError as e:
+            # If initialize fails with 4xx, server might not require sessions
+            # Try direct tools/list instead
+            if e.response.status_code >= 500:
+                raise
+            logger.debug("MCP initialize not required or failed, trying direct tools/list")
+
+        # Prepare headers for tools/list
+        request_headers = headers.copy()
+        if session_id:
+            request_headers["Mcp-Session-Id"] = session_id
+
+        # Request tools list
+        request_body = {
+            "jsonrpc": "2.0",
+            "id": str(uuid.uuid4()),
+            "method": "tools/list",
+            "params": {},
+        }
+
+        response = await client.post(
+            server_url,
+            json=request_body,
+            headers=request_headers,
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        result = response.json()
+
+        if "result" in result:
+            raw_tools = result["result"].get("tools", [])
+            # Prefix tool names with _serverName__ (valid for all LLM providers)
+            prefixed_tools = []
+            for tool in raw_tools:
+                prefixed_tool = dict(tool)
+                original_name = tool.get("name", "")
+                prefixed_tool["name"] = f"_{server_name}__{original_name}"
+                prefixed_tool["_original_name"] = original_name  # Store for tool calls
+                prefixed_tool["_session_id"] = session_id  # Store session for tool calls
+                prefixed_tools.append(prefixed_tool)
+
+            logger.info(
+                "Fetched tools from custom MCP server",
+                server=server_name,
+                url=server_url,
+                count=len(prefixed_tools),
+                has_session=bool(session_id),
+            )
+            return prefixed_tools
+        elif "error" in result:
+            raise RuntimeError(f"Failed to fetch tools from {server_name}: {result['error']}")
+
+        return []
+
+
+async def call_custom_server_tool(
+    server_url: str,
+    original_tool_name: str,
+    api_key: str | None,
+    session_id: str | None = None,
+    **kwargs: Any,
+) -> Any:
+    """Call a tool on a custom MCP server.
+
+    Handles MCP Streamable HTTP protocol including session management.
+
+    Args:
+        server_url: The MCP server endpoint URL.
+        original_tool_name: Original (unprefixed) name of the tool.
+        api_key: Optional API key for authentication.
+        session_id: Optional session ID from previous initialization.
+        **kwargs: Tool arguments.
+
+    Returns:
+        The tool result.
+    """
+    # MCP Streamable HTTP transport requires specific headers
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    async with httpx.AsyncClient(follow_redirects=True) as client:
+        # If we don't have a session ID, we need to initialize one
+        current_session_id = session_id
+        if not current_session_id:
+            try:
+                current_session_id = await _mcp_initialize_session(
+                    client, server_url, headers, timeout=30.0
+                )
+            except httpx.HTTPStatusError:
+                # Server might not require sessions
+                pass
+
+        # Add session ID to headers if available
+        if current_session_id:
+            headers["Mcp-Session-Id"] = current_session_id
+
+        request_body = {
+            "jsonrpc": "2.0",
+            "id": str(uuid.uuid4()),
+            "method": "tools/call",
+            "params": {
+                "name": original_tool_name,
+                "arguments": kwargs,
+            },
+        }
+
+        response = await client.post(
+            server_url,
+            json=request_body,
+            headers=headers,
+            timeout=60.0,
+        )
+        response.raise_for_status()
+        result = response.json()
+
+        if "result" in result:
+            content = result["result"].get("content", [])
+            if content and isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        text = item.get("text", "")
+                        try:
+                            return json.loads(text)
+                        except json.JSONDecodeError:
+                            return text
+            return content
+        elif "error" in result:
+            raise RuntimeError(f"Tool call failed: {result['error']}")
+
+        return result
+
+
+def _make_custom_tool_wrapper(
+    server_url: str,
+    prefixed_name: str,
+    original_name: str,
+    api_key: str | None,
+    session_id: str | None = None,
+    use_toon: bool = False,
+) -> Callable[..., Awaitable[Any]]:
+    """Factory function to create a wrapper for custom server tools.
+
+    Args:
+        server_url: The MCP server endpoint URL.
+        prefixed_name: Prefixed tool name (@serverName/toolName).
+        original_name: Original tool name (used for actual calls).
+        api_key: Optional API key for authentication.
+        session_id: Optional session ID for MCP session management.
+        use_toon: Whether to apply TOON transformation to results.
+    """
+    async def wrapper(**kwargs: Any) -> Any:
+        result = await call_custom_server_tool(
+            server_url, original_name, api_key, session_id=session_id, **kwargs
+        )
+        return format_tool_result_for_llm(result, use_toon=use_toon)
+
+    # Set __name__ for Pydantic AI
+    wrapper.__name__ = prefixed_name
+    return wrapper
+
+
+def create_custom_server_tools(
+    tool_defs: list[dict[str, Any]],
+    server_url: str,
+    api_key: str | None,
+    use_toon: bool = False,
+) -> list[Tool]:
+    """Create Pydantic AI Tool objects from custom server tool definitions.
+
+    Args:
+        tool_defs: List of tool definitions with prefixed names.
+        server_url: The MCP server endpoint URL.
+        api_key: Optional API key for authentication.
+        use_toon: Whether to apply TOON transformation to tool results.
+
+    Returns:
+        List of Pydantic AI Tool objects.
+    """
+    tools = []
+
+    permissive_validator = SchemaValidator(core_schema.any_schema())
+
+    for tool_def in tool_defs:
+        prefixed_name = tool_def.get("name", "")
+        original_name = tool_def.get("_original_name", "")
+        session_id = tool_def.get("_session_id")
+        description = tool_def.get("description", "")
+        input_schema = tool_def.get("inputSchema", {})
+
+        if not prefixed_name or not original_name:
+            continue
+
+        wrapper_fn = _make_custom_tool_wrapper(
+            server_url, prefixed_name, original_name, api_key,
+            session_id=session_id, use_toon=use_toon
+        )
+
+        function_schema = FunctionSchema(
+            function=wrapper_fn,
+            description=description or f"Custom tool: {prefixed_name}",
+            validator=permissive_validator,
+            json_schema=input_schema if input_schema else {"type": "object", "properties": {}},
+            takes_ctx=False,
+            is_async=True,
+            single_arg_name=None,
+            positional_fields=[],
+            var_positional_field=None,
+        )
+
+        tool = Tool(
+            function=wrapper_fn,
+            name=prefixed_name,
+            description=description or f"Custom tool: {prefixed_name}",
+            takes_ctx=False,
+            function_schema=function_schema,
+        )
+        tools.append(tool)
+        logger.debug("Created custom server tool", tool_name=prefixed_name)
+
+    return tools
+
+
 def _parse_tool_args(args: Any) -> dict[str, Any]:
     """Parse tool arguments from various formats.
 
@@ -620,6 +939,7 @@ class AgentOrchestrator:
         enable_tools: bool = True,
         use_toon_format: bool = False,
         use_tool_rag_mode: bool | None = None,
+        extra_mcp_servers: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[SSEEvent]:
         """Execute agent loop and yield SSE events.
 
@@ -640,6 +960,7 @@ class AgentOrchestrator:
             enable_tools: Whether to enable tool calling (default: True).
             use_toon_format: Request TOON format from Armory for tool results.
             use_tool_rag_mode: Whether to use Tool RAG mode (semantic tool search).
+            extra_mcp_servers: User's custom MCP servers to connect directly.
 
         Yields:
             SSE events for the response.
@@ -705,7 +1026,49 @@ class AgentOrchestrator:
                         count=len(discovered_tools),
                         tool_names=[t.name for t in discovered_tools],
                     )
-        elif enable_tools and not self._armory_available:
+
+        # Fetch tools from custom MCP servers (if any)
+        if enable_tools and extra_mcp_servers:
+            for server_config in extra_mcp_servers:
+                server_name = server_config.get("name", "unknown")
+                server_url = server_config.get("url", "")
+                server_api_key = server_config.get("api_key")
+
+                if not server_url:
+                    logger.warning("Custom MCP server missing URL", server=server_name)
+                    continue
+
+                try:
+                    custom_tool_defs = await fetch_custom_server_tools(
+                        server_url=server_url,
+                        server_name=server_name,
+                        api_key=server_api_key,
+                        timeout=30.0,
+                    )
+                    if custom_tool_defs:
+                        custom_tools = create_custom_server_tools(
+                            custom_tool_defs, server_url, server_api_key, use_toon=apply_toon
+                        )
+                        # Add to all_tools, avoiding duplicates
+                        existing_names = {t.name for t in all_tools}
+                        for tool in custom_tools:
+                            if tool.name not in existing_names:
+                                all_tools.append(tool)
+                        logger.info(
+                            "Added tools from custom MCP server",
+                            server=server_name,
+                            count=len(custom_tools),
+                        )
+                except Exception as e:
+                    # Log warning but don't block chat - graceful degradation
+                    logger.warning(
+                        "Failed to fetch tools from custom MCP server",
+                        server=server_name,
+                        url=server_url,
+                        error=str(e),
+                    )
+
+        if enable_tools and not self._armory_available and not extra_mcp_servers:
             # Only warn if tools were requested but unavailable
             yield ErrorEvent(
                 code="ARMORY_UNAVAILABLE",

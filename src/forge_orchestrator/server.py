@@ -90,6 +90,22 @@ class ToolsRefreshResponse(BaseModel):
     tool_count: int
 
 
+class MCPServerInput(BaseModel):
+    """Input for custom MCP server configuration."""
+
+    url: str = Field(description="MCP server endpoint URL")
+    api_key: str | None = Field(default=None, description="Optional API key")
+
+
+class MCPValidateResponse(BaseModel):
+    """Response body for MCP server validation."""
+
+    valid: bool
+    tool_count: int = 0
+    tools: list[dict[str, Any]] = Field(default_factory=list)
+    error: str | None = None
+
+
 class ConfigResponse(BaseModel):
     """Response body for client configuration."""
 
@@ -221,6 +237,47 @@ async def refresh_tools(request: Request) -> ToolsRefreshResponse:
     orchestrator: AgentOrchestrator = request.app.state.orchestrator
     tools = await orchestrator.refresh_tools()
     return ToolsRefreshResponse(status="refreshed", tool_count=len(tools))
+
+
+@app.post("/mcp/validate", response_model=MCPValidateResponse)
+async def validate_mcp_server(body: MCPServerInput) -> MCPValidateResponse:
+    """Validate a custom MCP server by testing connectivity.
+
+    Tests the server by calling tools/list and returning available tools.
+    Used by forge-ui to validate user-configured MCP servers.
+    """
+    from forge_orchestrator.orchestrator import fetch_custom_server_tools
+
+    try:
+        tools = await fetch_custom_server_tools(
+            server_url=body.url,
+            server_name="test",  # Name doesn't matter for validation
+            api_key=body.api_key,
+            timeout=10.0,  # 10 second timeout for validation
+        )
+        return MCPValidateResponse(
+            valid=True,
+            tool_count=len(tools),
+            tools=tools,
+        )
+    except TimeoutError:
+        return MCPValidateResponse(
+            valid=False,
+            error="Connection timed out (>10s)",
+        )
+    except Exception as e:
+        error_msg = str(e)
+        # Check for common auth errors
+        if "401" in error_msg or "403" in error_msg:
+            error_msg = "Authentication failed - check API key"
+        elif "404" in error_msg:
+            error_msg = "MCP endpoint not found at URL"
+        elif "connection" in error_msg.lower():
+            error_msg = f"Connection failed: {error_msg}"
+        return MCPValidateResponse(
+            valid=False,
+            error=error_msg,
+        )
 
 
 # ============================================================================
@@ -631,6 +688,7 @@ async def chat_stream(
                 enable_tools=body.enable_tools,
                 use_toon_format=body.use_toon_format,
                 use_tool_rag_mode=body.use_tool_rag_mode,
+                extra_mcp_servers=body.extra_mcp_servers,
             ):
                 # Get event type and serialize
                 event_type = get_event_type(event)
