@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
+from forge_orchestrator.keys import KeyProvider
 from forge_orchestrator.logging import configure_logging, get_logger
 from forge_orchestrator.models.api import (
     AddModelRequest,
@@ -51,7 +52,11 @@ class ChatRequest(BaseModel):
     )
     model: str | None = Field(
         default=None,
-        description="Model to use (defaults to server default)",
+        description="Model to use (e.g., 'anthropic/claude-sonnet-4' or 'gpt-4o')",
+    )
+    provider: str | None = Field(
+        default=None,
+        description="LLM provider (openrouter, openai, anthropic, google). If not specified, auto-detected from model.",
     )
     enable_tools: bool = Field(
         default=True,
@@ -64,6 +69,10 @@ class ChatRequest(BaseModel):
     use_tool_rag_mode: bool | None = Field(
         default=None,
         description="Use Tool RAG mode for semantic tool search. If None, uses server default.",
+    )
+    extra_mcp_servers: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="User's custom MCP servers to connect directly (for future use).",
     )
 
 
@@ -79,6 +88,17 @@ class ToolsRefreshResponse(BaseModel):
 
     status: str
     tool_count: int
+
+
+class ConfigResponse(BaseModel):
+    """Response body for client configuration."""
+
+    server_providers: dict[str, bool] = Field(
+        description="Which providers have keys configured server-side"
+    )
+    allow_byok: bool = Field(
+        description="Whether BYOK (header keys) is enabled"
+    )
 
 
 # ============================================================================
@@ -99,8 +119,12 @@ async def lifespan(app: FastAPI):
     await orchestrator.initialize()
     logger.info("Orchestrator initialized", mock_mode=settings.mock_llm)
 
+    # Initialize key provider for BYOK support
+    key_provider = KeyProvider(settings)
+
     # Store in app state
     app.state.orchestrator = orchestrator
+    app.state.key_provider = key_provider
 
     logger.info(
         "Forge Orchestrator started",
@@ -150,6 +174,25 @@ async def health(request: Request) -> HealthResponse:
     return HealthResponse(
         status="ok",
         armory_available=orchestrator._armory_available,
+    )
+
+
+# ============================================================================
+# Configuration Endpoint (for BYOK)
+# ============================================================================
+
+
+@app.get("/config", response_model=ConfigResponse)
+async def get_config(request: Request) -> ConfigResponse:
+    """Return client-relevant configuration.
+
+    Used by forge-ui to know which providers are available server-side
+    and whether BYOK (Bring Your Own Key) is enabled.
+    """
+    key_provider: KeyProvider = request.app.state.key_provider
+    return ConfigResponse(
+        server_providers=key_provider.get_configured_providers(),
+        allow_byok=key_provider.allow_header_keys,
     )
 
 
@@ -545,6 +588,11 @@ async def chat_stream(
     Sends a message with conversation history and streams the response.
     The client is responsible for maintaining conversation state.
 
+    BYOK Headers (optional):
+    - X-LLM-Key: API key for the LLM provider
+    - X-LLM-Provider: Provider name (openrouter, openai, anthropic, google)
+    - X-MCP-Keys: JSON object of MCP server keys
+
     Streams:
     - token: Streaming text tokens
     - thinking: Model thinking content (if supported)
@@ -555,6 +603,17 @@ async def chat_stream(
     - ping: Heartbeat
     """
     orchestrator: AgentOrchestrator = request.app.state.orchestrator
+    key_provider: KeyProvider = request.app.state.key_provider
+
+    # Get API key from headers or environment (header takes priority)
+    try:
+        api_key, resolved_provider = key_provider.get_llm_key(request, body.provider)
+    except HTTPException:
+        # Re-raise HTTP exceptions (like 401 for missing key)
+        raise
+
+    # Get MCP keys from headers (if any)
+    mcp_keys = key_provider.get_mcp_keys(request)
 
     async def event_generator():
         """Generate SSE events from the orchestrator."""
@@ -566,6 +625,9 @@ async def chat_stream(
                 messages=body.messages,
                 system_prompt=body.system_prompt,
                 model=body.model,
+                provider=resolved_provider,
+                api_key=api_key,
+                mcp_keys=mcp_keys,
                 enable_tools=body.enable_tools,
                 use_toon_format=body.use_toon_format,
                 use_tool_rag_mode=body.use_tool_rag_mode,

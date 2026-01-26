@@ -614,6 +614,9 @@ class AgentOrchestrator:
         messages: list[Any] | None = None,
         system_prompt: str | None = None,
         model: str | None = None,
+        provider: str | None = None,
+        api_key: str | None = None,
+        mcp_keys: dict[str, str] | None = None,
         enable_tools: bool = True,
         use_toon_format: bool = False,
         use_tool_rag_mode: bool | None = None,
@@ -631,6 +634,9 @@ class AgentOrchestrator:
             messages: Previous conversation history.
             system_prompt: Optional system prompt.
             model: Optional model override.
+            provider: LLM provider (openrouter, openai, anthropic, google).
+            api_key: API key for the provider (BYOK support).
+            mcp_keys: Dict of MCP server keys (server-name -> api-key).
             enable_tools: Whether to enable tool calling (default: True).
             use_toon_format: Request TOON format from Armory for tool results.
             use_tool_rag_mode: Whether to use Tool RAG mode (semantic tool search).
@@ -710,14 +716,18 @@ class AgentOrchestrator:
             logger.info("Tool calling disabled by user")
 
         # Create agent with wrapped tools (no toolsets - we handle MCP calls ourselves)
-        model_string = self._get_model_string(actual_model)
+        # Use _create_model to support BYOK (creates model instance with API key if provided)
+        model_instance = self._create_model(actual_model, provider, api_key)
+        model_display = actual_model if api_key else str(model_instance)
         logger.info(
             "Creating agent",
-            model=model_string,
+            model=model_display,
+            provider=provider,
+            byok=bool(api_key),
             tools_count=len(all_tools),
         )
         agent = Agent(
-            model=model_string,
+            model=model_instance,
             tools=all_tools,
         )
 
@@ -737,7 +747,7 @@ class AgentOrchestrator:
                     agent=agent,
                     user_message=user_message,
                     message_history=message_history,
-                    model_string=model_string,
+                    model_instance=model_instance,
                     all_tools=all_tools,
                     armory_url=self.settings.armory_url,
                     headers=headers,
@@ -991,7 +1001,7 @@ class AgentOrchestrator:
         agent: Agent,
         user_message: str,
         message_history: list[ModelMessage],
-        model_string: str,
+        model_instance: Any,
         all_tools: list[Tool],
         armory_url: str,
         headers: dict[str, str],
@@ -1006,7 +1016,7 @@ class AgentOrchestrator:
             agent: The Pydantic AI agent (with search_tools only).
             user_message: The user's message.
             message_history: Conversation history.
-            model_string: Model string for creating new agent.
+            model_instance: Model instance or string for creating new agent.
             all_tools: All wrapped tools (from armory).
             armory_url: Base Armory URL for discovered tool calls.
             headers: Request headers.
@@ -1108,7 +1118,7 @@ class AgentOrchestrator:
 
                 # Create new agent with all tools including discovered ones
                 agent2 = Agent(
-                    model=model_string,
+                    model=model_instance,
                     tools=combined_tools,
                 )
 
@@ -1266,6 +1276,117 @@ class AgentOrchestrator:
             response=cumulative.strip(),
             usage=TokenUsage(prompt_tokens=50, completion_tokens=len(response.split())),
         )
+
+    def _create_model(
+        self,
+        model: str,
+        provider: str | None = None,
+        api_key: str | None = None,
+    ) -> Any:
+        """Create a model instance or string for pydantic-ai.
+
+        If an API key is provided (BYOK mode), creates a model instance
+        with the key. Otherwise, returns a model string and lets pydantic-ai
+        use environment variables.
+
+        Args:
+            model: The model name/identifier.
+            provider: LLM provider (openrouter, openai, anthropic, google).
+            api_key: API key for the provider.
+
+        Returns:
+            Model instance or model string.
+        """
+        # If no API key provided, fall back to string-based routing
+        if not api_key:
+            return self._get_model_string(model)
+
+        # Determine the actual model name and provider
+        actual_model = model
+        actual_provider = provider
+
+        # Handle OpenRouter format (provider/model)
+        if "/" in model and not any(model.startswith(p) for p in [
+            "openrouter:", "openai:", "anthropic:", "google-gla:"
+        ]):
+            parts = model.split("/", 1)
+            model_provider_prefix = parts[0].lower()
+            model_name_only = parts[1]
+
+            # If provider not explicitly set, use openrouter
+            if not actual_provider:
+                actual_provider = "openrouter"
+                actual_model = model  # Keep full model name for OpenRouter
+            elif actual_provider in ("openai", "anthropic", "google", "google-gla"):
+                # For native providers, strip the provider prefix from model name
+                actual_model = model_name_only
+            else:
+                actual_model = model  # Keep full name for OpenRouter
+
+        # Handle explicit provider prefix (e.g., "google-gla:gemini-flash")
+        elif ":" in model:
+            prefix, actual_model = model.split(":", 1)
+            if not actual_provider:
+                actual_provider = prefix
+
+        # Default provider
+        if not actual_provider:
+            actual_provider = "openrouter"
+
+        # Create model instance based on provider
+        try:
+            if actual_provider == "openrouter":
+                from pydantic_ai.models.openai import OpenAIModel
+                from pydantic_ai.providers.openai import OpenAIProvider
+
+                # OpenRouter uses OpenAI-compatible API
+                provider_instance = OpenAIProvider(
+                    api_key=api_key,
+                    base_url="https://openrouter.ai/api/v1",
+                )
+                return OpenAIModel(actual_model, provider=provider_instance)
+
+            elif actual_provider == "openai":
+                from pydantic_ai.models.openai import OpenAIModel
+                from pydantic_ai.providers.openai import OpenAIProvider
+
+                provider_instance = OpenAIProvider(api_key=api_key)
+                return OpenAIModel(actual_model, provider=provider_instance)
+
+            elif actual_provider == "anthropic":
+                from pydantic_ai.models.anthropic import AnthropicModel
+                from pydantic_ai.providers.anthropic import AnthropicProvider
+
+                provider_instance = AnthropicProvider(api_key=api_key)
+                return AnthropicModel(actual_model, provider=provider_instance)
+
+            elif actual_provider in ("google", "google-gla"):
+                from pydantic_ai.models.google import GoogleModel
+                from pydantic_ai.providers.google import GoogleProvider
+
+                provider_instance = GoogleProvider(api_key=api_key)
+                return GoogleModel(actual_model, provider=provider_instance)
+
+            else:
+                # Unknown provider - try OpenRouter as fallback
+                logger.warning(
+                    "Unknown provider, using OpenRouter",
+                    provider=actual_provider,
+                    model=actual_model,
+                )
+                from pydantic_ai.models.openai import OpenAIModel
+                from pydantic_ai.providers.openai import OpenAIProvider
+
+                provider_instance = OpenAIProvider(
+                    api_key=api_key,
+                    base_url="https://openrouter.ai/api/v1",
+                )
+                return OpenAIModel(actual_model, provider=provider_instance)
+
+        except ImportError as e:
+            logger.error("Failed to import model class", error=str(e))
+            # Fall back to string-based model
+            return self._get_model_string(model)
 
     def _get_model_string(self, model: str) -> str:
         """Convert model name to Pydantic AI format with provider routing.
