@@ -90,6 +90,10 @@ class Settings(BaseSettings):
     mock_llm: bool = False  # For testing without real LLM
     show_thinking: bool = True  # Stream thinking tokens if model supports
 
+    # TOON configuration (Token-Oriented Object Notation)
+    use_toon: bool = False  # TOON format controlled per-request via use_toon_format
+    toon_min_array_size: int = 2  # Minimum array size to trigger TOON conversion
+
     # SSE settings
     heartbeat_interval: int = 15  # Seconds between ping events
     tool_timeout_warning: int = 30  # Seconds before showing "still working"

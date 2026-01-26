@@ -11,12 +11,13 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 from pydantic_ai import Agent, Tool
-from pydantic_ai.mcp import MCPServerStreamableHTTP
+from pydantic_ai._function_schema import FunctionSchema
 from pydantic_ai.messages import (
     ModelMessage,
     ToolCallPart,
     ToolReturnPart,
 )
+from pydantic_core import SchemaValidator, core_schema
 
 from forge_orchestrator.logging import get_logger
 from forge_orchestrator.mcp_client import ArmoryClient
@@ -35,6 +36,7 @@ from forge_orchestrator.models import (
 from forge_orchestrator.models_cache import ModelsCache
 from forge_orchestrator.models_config import ModelsConfig
 from forge_orchestrator.openrouter_client import OpenRouterClient
+from forge_orchestrator.toon import is_toon_available, transform_result
 
 if TYPE_CHECKING:
     from forge_orchestrator.settings import Settings
@@ -150,16 +152,113 @@ async def call_armory_tool(
         return result
 
 
+async def fetch_armory_tools(
+    armory_url: str,
+    headers: dict[str, str],
+) -> list[dict[str, Any]]:
+    """Fetch tools list from Armory via MCP protocol.
+
+    Args:
+        armory_url: The Armory MCP endpoint URL.
+        headers: Request headers.
+
+    Returns:
+        List of tool definitions with name, description, and inputSchema.
+    """
+    request_body = {
+        "jsonrpc": "2.0",
+        "id": str(uuid.uuid4()),
+        "method": "tools/list",
+        "params": {},
+    }
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            armory_url,
+            json=request_body,
+            headers={**headers, "Content-Type": "application/json"},
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        result = response.json()
+
+        if "result" in result:
+            tools = result["result"].get("tools", [])
+            logger.info("Fetched tools from armory", count=len(tools))
+            return tools
+        elif "error" in result:
+            raise RuntimeError(f"Failed to fetch tools: {result['error']}")
+
+        return []
+
+
+def _parse_tool_args(args: Any) -> dict[str, Any]:
+    """Parse tool arguments from various formats.
+
+    Args:
+        args: Raw arguments (str JSON, dict, or other)
+
+    Returns:
+        Parsed arguments as dict
+    """
+    if isinstance(args, str):
+        try:
+            return json.loads(args)
+        except json.JSONDecodeError:
+            return {"raw": args}
+    if isinstance(args, dict):
+        return args
+    return {"raw": args}
+
+
+def format_tool_result_for_llm(result: Any, use_toon: bool = False) -> Any:
+    """Format a tool result for LLM consumption.
+
+    Optionally applies TOON transformation for token efficiency.
+
+    Args:
+        result: The raw tool result (dict, list, str, etc.)
+        use_toon: Whether to apply TOON transformation
+
+    Returns:
+        Formatted result (string if TOON applied, original otherwise)
+    """
+    if not use_toon or not is_toon_available():
+        return result
+
+    # TOON transformation for structured data
+    formatted, content_type = transform_result(result, prefer_toon=True)
+    if content_type == "text/toon":
+        logger.debug("Tool result formatted as TOON", size=len(formatted))
+        return formatted
+
+    # Return original if TOON conversion failed or wasn't beneficial
+    return result
+
+
 def _make_tool_wrapper(
-    armory_url: str, tool_name: str, headers: dict[str, str]
+    armory_url: str,
+    tool_name: str,
+    headers: dict[str, str],
+    use_toon: bool = False,
 ) -> Callable[..., Awaitable[Any]]:
     """Factory function to create a tool wrapper with proper closure capture.
 
     This is necessary because Pydantic AI's Tool class requires a function with
     __name__ attribute, and functools.partial doesn't have one.
+
+    Args:
+        armory_url: The Armory MCP endpoint URL.
+        tool_name: Name of the tool to call.
+        headers: Request headers.
+        use_toon: Whether to apply TOON transformation to results.
     """
     async def wrapper(**kwargs: Any) -> Any:
-        return await call_armory_tool(armory_url, tool_name, headers, **kwargs)
+        result = await call_armory_tool(armory_url, tool_name, headers, **kwargs)
+        # Don't apply TOON to search_tools - we need to parse results for RAG auto-continue
+        if tool_name == "search_tools":
+            return result
+        return format_tool_result_for_llm(result, use_toon=use_toon)
 
     # Set __name__ so Pydantic AI can use it for schema generation
     wrapper.__name__ = tool_name
@@ -170,6 +269,7 @@ def create_discovered_tools(
     discovered: list[dict[str, Any]],
     armory_url: str,
     headers: dict[str, str],
+    use_toon: bool = False,
 ) -> list[Tool]:
     """Create Pydantic AI Tool objects from discovered tool definitions.
 
@@ -177,28 +277,49 @@ def create_discovered_tools(
         discovered: List of tool definitions from search_tools.
         armory_url: The Armory MCP endpoint URL.
         headers: Request headers for Armory calls.
+        use_toon: Whether to apply TOON transformation to tool results.
 
     Returns:
         List of Pydantic AI Tool objects.
     """
     tools = []
 
+    # Create a permissive validator that accepts any dict
+    # The actual validation happens at the MCP server
+    permissive_validator = SchemaValidator(core_schema.any_schema())
+
     for tool_def in discovered:
         name = tool_def.get("name", "")
         description = tool_def.get("description", "")
+        input_schema = tool_def.get("inputSchema", {})
 
         if not name:
             continue
 
         # Create a wrapper function using factory to properly capture values
-        wrapper_fn = _make_tool_wrapper(armory_url, name, headers)
+        wrapper_fn = _make_tool_wrapper(armory_url, name, headers, use_toon=use_toon)
 
-        # Create the Tool object
+        # Create FunctionSchema with the MCP tool's inputSchema
+        # This ensures the LLM sees the correct parameter schema
+        function_schema = FunctionSchema(
+            function=wrapper_fn,
+            description=description or f"Discovered tool: {name}",
+            validator=permissive_validator,
+            json_schema=input_schema if input_schema else {"type": "object", "properties": {}},
+            takes_ctx=False,
+            is_async=True,
+            single_arg_name=None,
+            positional_fields=[],
+            var_positional_field=None,
+        )
+
+        # Create the Tool object with explicit function_schema
         tool = Tool(
             function=wrapper_fn,
             name=name,
             description=description or f"Discovered tool: {name}",
             takes_ctx=False,
+            function_schema=function_schema,
         )
         tools.append(tool)
         logger.debug("Created discovered tool", tool_name=name)
@@ -237,7 +358,6 @@ class AgentOrchestrator:
         """
         self.settings = settings
         self._settings = settings  # Alias for API endpoint access
-        self._mcp_server: MCPServerStreamableHTTP | None = None
         self._armory_client: ArmoryClient | None = None
         self._armory_available = False
 
@@ -286,12 +406,6 @@ class AgentOrchestrator:
 
         try:
             if await self._armory_client.ping():
-                # Pass caller header so Armory knows requests come from orchestrator
-                # Note: RAG mode is determined per-request, not at init time
-                self._mcp_server = MCPServerStreamableHTTP(
-                    self.settings.armory_url,
-                    headers={"X-Caller": "forge-orchestrator"},
-                )
                 self._armory_available = True
                 logger.info("Connected to Armory", armory_url=self.settings.armory_url)
             else:
@@ -340,10 +454,6 @@ class AgentOrchestrator:
 
         try:
             if await self._armory_client.ping():
-                self._mcp_server = MCPServerStreamableHTTP(
-                    self.settings.armory_url,
-                    headers={"X-Caller": "forge-orchestrator"},
-                )
                 self._armory_available = True
                 return await self._armory_client.list_tools()
         except Exception as e:
@@ -537,41 +647,53 @@ class AgentOrchestrator:
         # Get model or use default
         actual_model = model or self.settings.default_model
 
-        # Build toolsets (only if tools are enabled)
-        toolsets = []
-        discovered_tools: list[Tool] = []
+        # Build tools list (only if tools are enabled)
+        all_tools: list[Tool] = []
+        headers: dict[str, str] = {}
+        apply_toon = use_toon_format or self.settings.use_toon
         if enable_tools and self._armory_available:
             # Build headers for this request
-            # Note: MCP SDK overwrites Accept header, so we use X-Prefer-Format for TOON
             headers = {"X-Caller": "forge-orchestrator"}
-            if use_toon_format:
-                headers["X-Prefer-Format"] = "toon"
-                logger.info("TOON format enabled for tool results")
 
-            # Create MCP server with request-specific headers
+            # Fetch tools from Armory and create wrapped tools
             # Use RAG mode URL if enabled (semantic tool search)
             armory_url = self._get_armory_url(use_rag_mode=use_tool_rag_mode or False)
-            mcp_server = MCPServerStreamableHTTP(
-                armory_url,
-                headers=headers,
-            )
-            toolsets.append(mcp_server)
-            logger.info(
-                "MCP toolset added to agent",
-                use_toon=use_toon_format,
-                tool_rag_mode=use_tool_rag_mode,
-            )
+            try:
+                tool_defs = await fetch_armory_tools(armory_url, headers)
+                if tool_defs:
+                    # Create wrapped tools with TOON transformation support
+                    # Use base URL for tool calls (not RAG mode URL)
+                    base_armory_url = self.settings.armory_url
+                    all_tools = create_discovered_tools(
+                        tool_defs, base_armory_url, headers, use_toon=apply_toon
+                    )
+                    logger.info(
+                        "Created wrapped tools from armory",
+                        count=len(all_tools),
+                        tool_rag_mode=use_tool_rag_mode,
+                        use_toon=apply_toon,
+                    )
+            except Exception as e:
+                logger.warning("Failed to fetch tools from armory", error=str(e))
+                yield ErrorEvent(
+                    code="TOOL_FETCH_FAILED",
+                    message=f"Failed to fetch tools: {e}",
+                    retryable=True,
+                )
 
-            # In RAG mode, extract discovered tools from message history
+            # In RAG mode, also add discovered tools from message history
             # These are tools returned by previous search_tools calls
             if use_tool_rag_mode and messages:
                 discovered_defs = extract_discovered_tools(messages)
                 if discovered_defs:
-                    # Use base Armory URL (not RAG mode) for tool calls
-                    base_armory_url = self.settings.armory_url
                     discovered_tools = create_discovered_tools(
-                        discovered_defs, base_armory_url, headers
+                        discovered_defs, self.settings.armory_url, headers, use_toon=apply_toon
                     )
+                    # Add discovered tools, avoiding duplicates
+                    existing_names = {t.name for t in all_tools}
+                    for tool in discovered_tools:
+                        if tool.name not in existing_names:
+                            all_tools.append(tool)
                     logger.info(
                         "Added discovered tools from search_tools results",
                         count=len(discovered_tools),
@@ -587,18 +709,16 @@ class AgentOrchestrator:
         elif not enable_tools:
             logger.info("Tool calling disabled by user")
 
-        # Create agent
+        # Create agent with wrapped tools (no toolsets - we handle MCP calls ourselves)
         model_string = self._get_model_string(actual_model)
         logger.info(
             "Creating agent",
             model=model_string,
-            has_toolsets=bool(toolsets),
-            discovered_tools_count=len(discovered_tools),
+            tools_count=len(all_tools),
         )
         agent = Agent(
             model=model_string,
-            toolsets=toolsets,
-            tools=discovered_tools,  # Empty list is fine, None is not
+            tools=all_tools,
         )
 
         # Build message history
@@ -608,7 +728,7 @@ class AgentOrchestrator:
         )
 
         # Use non-streaming when tools are available (pydantic-ai streaming + MCP bug)
-        if toolsets:
+        if all_tools:
             logger.info("Using non-streaming mode (tools available)")
 
             # In RAG mode, we may need to auto-continue after search_tools
@@ -618,9 +738,10 @@ class AgentOrchestrator:
                     user_message=user_message,
                     message_history=message_history,
                     model_string=model_string,
-                    toolsets=toolsets,
+                    all_tools=all_tools,
                     armory_url=self.settings.armory_url,
                     headers=headers,
+                    use_toon=apply_toon,
                 ):
                     yield event
             else:
@@ -683,7 +804,10 @@ class AgentOrchestrator:
                         thinking = getattr(msg, 'thinking', None)
                         if thinking:
                             cumulative_thinking = str(thinking)
-                            yield ThinkingEvent(content=cumulative_thinking, cumulative=cumulative_thinking)
+                            yield ThinkingEvent(
+                                content=cumulative_thinking,
+                                cumulative=cumulative_thinking,
+                            )
                             break
 
                     logger.info(
@@ -751,7 +875,10 @@ class AgentOrchestrator:
                     thinking = getattr(msg, 'thinking', None)
                     if thinking:
                         cumulative_thinking = str(thinking)
-                        yield ThinkingEvent(content=cumulative_thinking, cumulative=cumulative_thinking)
+                        yield ThinkingEvent(
+                                content=cumulative_thinking,
+                                cumulative=cumulative_thinking,
+                            )
                         break
 
                 # Extract tool calls and results from message history
@@ -767,16 +894,13 @@ class AgentOrchestrator:
                                     tool_name=part.tool_name,
                                     tool_call_id=part.tool_call_id,
                                 )
-                                try:
-                                    args = json.loads(part.args) if isinstance(part.args, str) else part.args
-                                except Exception:
-                                    args = {"raw": part.args}
+                                args = _parse_tool_args(part.args)
 
                                 tool_id = part.tool_call_id or f"tc_{uuid.uuid4().hex[:8]}"
                                 yield ToolCallEvent(
                                     id=tool_id,
                                     tool_name=part.tool_name,
-                                    arguments=args if isinstance(args, dict) else {},
+                                    arguments=args,
                                     status="complete",
                                 )
 
@@ -805,12 +929,13 @@ class AgentOrchestrator:
 
                                 # Calculate latency from timestamps
                                 # ToolReturnPart has its own timestamp field
-                                latency_ms = 0
                                 tool_id = part.tool_call_id or "unknown"
                                 call_timestamp = tool_call_timestamps.get(tool_id)
                                 return_timestamp = part.timestamp
+                                latency_ms = 0
                                 if call_timestamp and return_timestamp:
-                                    latency_ms = int((return_timestamp - call_timestamp).total_seconds() * 1000)
+                                    delta = return_timestamp - call_timestamp
+                                    latency_ms = int(delta.total_seconds() * 1000)
 
                                 yield ToolResultEvent(
                                     tool_call_id=tool_id,
@@ -867,9 +992,10 @@ class AgentOrchestrator:
         user_message: str,
         message_history: list[ModelMessage],
         model_string: str,
-        toolsets: list,
+        all_tools: list[Tool],
         armory_url: str,
         headers: dict[str, str],
+        use_toon: bool = False,
     ) -> AsyncIterator[SSEEvent]:
         """Run agent with auto-continue for RAG mode.
 
@@ -881,9 +1007,10 @@ class AgentOrchestrator:
             user_message: The user's message.
             message_history: Conversation history.
             model_string: Model string for creating new agent.
-            toolsets: MCP toolsets.
+            all_tools: All wrapped tools (from armory).
             armory_url: Base Armory URL for discovered tool calls.
             headers: Request headers.
+            use_toon: Whether to apply TOON transformation to tool results.
 
         Yields:
             SSE events for the response.
@@ -910,16 +1037,13 @@ class AgentOrchestrator:
                     if hasattr(msg, 'parts'):
                         for part in msg.parts:
                             if isinstance(part, ToolCallPart):
-                                try:
-                                    args = json.loads(part.args) if isinstance(part.args, str) else part.args
-                                except Exception:
-                                    args = {"raw": part.args}
+                                args = _parse_tool_args(part.args)
 
                                 tool_id = part.tool_call_id or f"tc_{uuid.uuid4().hex[:8]}"
                                 first_run_events.append(ToolCallEvent(
                                     id=tool_id,
                                     tool_name=part.tool_name,
-                                    arguments=args if isinstance(args, dict) else {},
+                                    arguments=args,
                                     status="complete",
                                 ))
 
@@ -936,7 +1060,8 @@ class AgentOrchestrator:
 
                                 # Check if this is a search_tools result
                                 if part.tool_name == "search_tools":
-                                    if isinstance(result_content, dict) and "tools" in result_content:
+                                    is_valid = isinstance(result_content, dict)
+                                    if is_valid and "tools" in result_content:
                                         search_tools_results.extend(result_content["tools"])
                                         logger.info(
                                             "RAG auto-continue: Found search_tools result",
@@ -957,9 +1082,9 @@ class AgentOrchestrator:
                     discovered_count=len(search_tools_results),
                 )
 
-                # Create discovered tools
+                # Create discovered tools with TOON transformation if enabled
                 discovered_tools = create_discovered_tools(
-                    search_tools_results, armory_url, headers
+                    search_tools_results, armory_url, headers, use_toon=use_toon
                 )
 
                 # Stream first response (the "I found tools..." message)
@@ -974,11 +1099,17 @@ class AgentOrchestrator:
                 # Build updated message history including first iteration
                 updated_history = (message_history or []) + first_run_new_messages
 
-                # Create new agent with discovered tools
+                # Combine all_tools with discovered tools (avoiding duplicates)
+                existing_names = {t.name for t in all_tools}
+                combined_tools = list(all_tools)
+                for tool in discovered_tools:
+                    if tool.name not in existing_names:
+                        combined_tools.append(tool)
+
+                # Create new agent with all tools including discovered ones
                 agent2 = Agent(
                     model=model_string,
-                    toolsets=toolsets,
-                    tools=discovered_tools,
+                    tools=combined_tools,
                 )
 
                 # Second iteration - now has discovered tools available
@@ -997,10 +1128,7 @@ class AgentOrchestrator:
                         if hasattr(msg, 'parts'):
                             for part in msg.parts:
                                 if isinstance(part, ToolCallPart):
-                                    try:
-                                        args = json.loads(part.args) if isinstance(part.args, str) else part.args
-                                    except Exception:
-                                        args = {"raw": part.args}
+                                    args = _parse_tool_args(part.args)
 
                                     tool_id = part.tool_call_id or f"tc_{uuid.uuid4().hex[:8]}"
                                     yield ToolCallEvent(
@@ -1023,7 +1151,8 @@ class AgentOrchestrator:
                                     return_timestamp = part.timestamp
                                     latency_ms = 0
                                     if call_timestamp and return_timestamp:
-                                        latency_ms = int((return_timestamp - call_timestamp).total_seconds() * 1000)
+                                        delta = return_timestamp - call_timestamp
+                                        latency_ms = int(delta.total_seconds() * 1000)
 
                                     yield ToolResultEvent(
                                         tool_call_id=tool_id,
@@ -1175,9 +1304,13 @@ class AgentOrchestrator:
         if any(model.startswith(p) for p in pydantic_providers):
             return model
 
-        # Check for OpenRouter slash format (e.g., "anthropic/claude-sonnet-4")
+        # Check for OpenRouter slash format (e.g., "google/gemini-3-flash-preview")
         if "/" in model:
-            # This is OpenRouter format - route through OpenRouter
+            # Try to route to native provider if API key is available
+            native_result = self._try_native_provider_from_openrouter_format(model)
+            if native_result:
+                return native_result
+            # Fall back to OpenRouter
             return f"openrouter:{model}"
 
         # Auto-detect provider based on model name patterns
@@ -1242,5 +1375,50 @@ class AgentOrchestrator:
             else:
                 logger.warning("Google model requested but no API key available")
                 return "google-gla"  # Will fail with clear error
+
+        return None
+
+    def _try_native_provider_from_openrouter_format(self, model: str) -> str | None:
+        """Try to route OpenRouter format model to native provider.
+
+        When a model is in OpenRouter format (e.g., "google/gemini-3-flash-preview"),
+        check if we have the corresponding native API key and can route directly.
+
+        Args:
+            model: Model in OpenRouter format (provider/model-name).
+
+        Returns:
+            Native format string (e.g., "google-gla:gemini-3-flash-preview") or None.
+        """
+        if "/" not in model:
+            return None
+
+        provider_prefix, model_name = model.split("/", 1)
+        provider_prefix = provider_prefix.lower()
+
+        # Map OpenRouter provider prefixes to native providers
+        # Check if corresponding API key is available
+        native_provider: str | None = None
+        has_api_key = False
+
+        if provider_prefix == "openai":
+            native_provider = "openai"
+            has_api_key = bool(self.settings.openai_api_key)
+        elif provider_prefix == "anthropic":
+            native_provider = "anthropic"
+            has_api_key = bool(self.settings.anthropic_api_key)
+        elif provider_prefix == "google":
+            native_provider = "google-gla"
+            has_api_key = bool(self.settings.gemini_api_key)
+        # meta-llama, mistralai, etc. - no native API, always use OpenRouter
+
+        if native_provider and has_api_key:
+            logger.info(
+                "Routing to native provider",
+                openrouter_model=model,
+                native_provider=native_provider,
+                native_model=model_name,
+            )
+            return f"{native_provider}:{model_name}"
 
         return None

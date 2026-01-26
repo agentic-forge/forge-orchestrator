@@ -59,7 +59,7 @@ class ChatRequest(BaseModel):
     )
     use_toon_format: bool = Field(
         default=False,
-        description="Request TOON format for tool results (reduces tokens)",
+        description="Enable TOON format for tool results (reduces tokens via local transformation)",
     )
     use_tool_rag_mode: bool | None = Field(
         default=None,

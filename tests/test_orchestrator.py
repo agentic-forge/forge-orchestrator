@@ -22,8 +22,8 @@ class TestAgentOrchestrator:
     ) -> None:
         """Test initialization in mock mode."""
         assert initialized_orchestrator.settings.mock_llm is True
-        # No MCP server in mock mode
-        assert initialized_orchestrator._mcp_server is None
+        # Armory not available in mock mode
+        assert initialized_orchestrator._armory_available is False
 
     async def test_run_stream_mock_basic(
         self, initialized_orchestrator: AgentOrchestrator
