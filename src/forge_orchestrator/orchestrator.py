@@ -1668,23 +1668,28 @@ class AgentOrchestrator:
         actual_model = model
         actual_provider = provider
 
+        # Handle frontend composite format (provider::model)
+        # e.g., "openrouter::google/gemini-3-flash-preview"
+        if "::" in model:
+            parts = model.split("::", 1)
+            if not actual_provider:
+                actual_provider = parts[0]
+            actual_model = parts[1]
+            model = actual_model  # Update model for further processing
+
         # Handle OpenRouter format (provider/model)
+        # Models in "provider/model" format are OpenRouter models
         if "/" in model and not any(model.startswith(p) for p in [
             "openrouter:", "openai:", "anthropic:", "google-gla:"
         ]):
-            parts = model.split("/", 1)
-            model_provider_prefix = parts[0].lower()
-            model_name_only = parts[1]
-
-            # If provider not explicitly set, use openrouter
-            if not actual_provider:
-                actual_provider = "openrouter"
-                actual_model = model  # Keep full model name for OpenRouter
-            elif actual_provider in ("openai", "anthropic", "google", "google-gla"):
-                # For native providers, strip the provider prefix from model name
-                actual_model = model_name_only
-            else:
-                actual_model = model  # Keep full name for OpenRouter
+            # Validate that provider matches the model format
+            if actual_provider and actual_provider != "openrouter":
+                raise ValueError(
+                    f"Model '{model}' is in OpenRouter format (provider/model) but provider "
+                    f"'{actual_provider}' was specified. Use provider='openrouter' for this model."
+                )
+            actual_provider = "openrouter"
+            actual_model = model  # Keep full model name for OpenRouter
 
         # Handle explicit provider prefix (e.g., "google-gla:gemini-flash")
         elif ":" in model:
@@ -1774,6 +1779,23 @@ class AgentOrchestrator:
         Returns:
             Model string in Pydantic AI format.
         """
+        # Handle frontend composite format (provider::model)
+        # e.g., "openrouter::google/gemini-3-flash-preview" -> route to openrouter
+        if "::" in model:
+            parts = model.split("::", 1)
+            routing_provider = parts[0]
+            actual_model = parts[1]
+
+            # Map routing provider to pydantic-ai format
+            provider_map = {
+                "openrouter": "openrouter",
+                "openai": "openai",
+                "anthropic": "anthropic",
+                "google": "google-gla",
+            }
+            pydantic_provider = provider_map.get(routing_provider, "openrouter")
+            return f"{pydantic_provider}:{actual_model}"
+
         # Known pydantic-ai provider prefixes
         pydantic_providers = [
             "openrouter:",
@@ -1789,12 +1811,9 @@ class AgentOrchestrator:
             return model
 
         # Check for OpenRouter slash format (e.g., "google/gemini-3-flash-preview")
+        # Models in provider/model format are OpenRouter models - route to OpenRouter
+        # Don't auto-route to native providers as this overrides user choice
         if "/" in model:
-            # Try to route to native provider if API key is available
-            native_result = self._try_native_provider_from_openrouter_format(model)
-            if native_result:
-                return native_result
-            # Fall back to OpenRouter
             return f"openrouter:{model}"
 
         # Auto-detect provider based on model name patterns
@@ -1859,50 +1878,5 @@ class AgentOrchestrator:
             else:
                 logger.warning("Google model requested but no API key available")
                 return "google-gla"  # Will fail with clear error
-
-        return None
-
-    def _try_native_provider_from_openrouter_format(self, model: str) -> str | None:
-        """Try to route OpenRouter format model to native provider.
-
-        When a model is in OpenRouter format (e.g., "google/gemini-3-flash-preview"),
-        check if we have the corresponding native API key and can route directly.
-
-        Args:
-            model: Model in OpenRouter format (provider/model-name).
-
-        Returns:
-            Native format string (e.g., "google-gla:gemini-3-flash-preview") or None.
-        """
-        if "/" not in model:
-            return None
-
-        provider_prefix, model_name = model.split("/", 1)
-        provider_prefix = provider_prefix.lower()
-
-        # Map OpenRouter provider prefixes to native providers
-        # Check if corresponding API key is available
-        native_provider: str | None = None
-        has_api_key = False
-
-        if provider_prefix == "openai":
-            native_provider = "openai"
-            has_api_key = bool(self.settings.openai_api_key)
-        elif provider_prefix == "anthropic":
-            native_provider = "anthropic"
-            has_api_key = bool(self.settings.anthropic_api_key)
-        elif provider_prefix == "google":
-            native_provider = "google-gla"
-            has_api_key = bool(self.settings.gemini_api_key)
-        # meta-llama, mistralai, etc. - no native API, always use OpenRouter
-
-        if native_provider and has_api_key:
-            logger.info(
-                "Routing to native provider",
-                openrouter_model=model,
-                native_provider=native_provider,
-                native_model=model_name,
-            )
-            return f"{native_provider}:{model_name}"
 
         return None

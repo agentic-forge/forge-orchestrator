@@ -465,15 +465,29 @@ async def fetch_models_from_provider(
 ) -> dict[str, Any]:
     """Fetch models from a provider's API.
 
-    Only works for providers with has_api=True (OpenAI, OpenRouter).
+    Only works for providers with has_api=True (OpenAI, OpenRouter, Google).
+    Supports BYOK - user can pass their API key via X-LLM-Key header.
     """
+    from pydantic import SecretStr
+
     from forge_orchestrator.models import DeprecatedModel, FetchModelsRequest, FetchModelsResponse
     from forge_orchestrator.providers import ProviderError, provider_registry
 
     orchestrator: AgentOrchestrator = request.app.state.orchestrator
 
-    # Configure registry
+    # Configure registry with server-side keys
     provider_registry.configure_from_settings(orchestrator._settings)
+
+    # Check for BYOK key from headers
+    byok_key = None
+    if orchestrator._settings.allow_header_keys:
+        header_key = request.headers.get("X-LLM-Key")
+        header_provider = request.headers.get("X-LLM-Provider")
+        # Only use BYOK key if it matches the requested provider
+        if header_key and (header_provider == body.provider or header_provider is None):
+            byok_key = header_key
+            # Temporarily set the BYOK key for this provider
+            provider_registry.set_api_key(body.provider, SecretStr(byok_key))
 
     provider = provider_registry.get(body.provider)
     if not provider:
@@ -488,7 +502,7 @@ async def fetch_models_from_provider(
     if not provider.is_configured:
         raise HTTPException(
             status_code=400,
-            detail=f"Provider {body.provider} is not configured. Add API key to .env file.",
+            detail=f"Provider {body.provider} is not configured. Enter your API key in Settings or add server key to .env file.",
         )
 
     try:
@@ -663,6 +677,7 @@ async def chat_stream(
     key_provider: KeyProvider = request.app.state.key_provider
 
     # Get API key from headers or environment (header takes priority)
+    # Frontend is responsible for sending the correct provider based on model format
     try:
         api_key, resolved_provider = key_provider.get_llm_key(request, body.provider)
     except HTTPException:
