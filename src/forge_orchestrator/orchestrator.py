@@ -32,6 +32,7 @@ from forge_orchestrator.models import (
     TokenUsage,
     ToolCallEvent,
     ToolResultEvent,
+    UiMetadata,
 )
 from forge_orchestrator.models_cache import ModelsCache
 from forge_orchestrator.models_config import ModelsConfig
@@ -927,6 +928,43 @@ class AgentOrchestrator:
         # Fallback: convert to string
         return str(content)
 
+    def _extract_ui_metadata(self, content: Any) -> UiMetadata | None:
+        """Extract _meta.ui from tool result if present.
+
+        MCP Apps tools return UI metadata in _meta.ui field containing:
+        - resourceUri: URI to the UI resource (e.g., ui://weather__location-picker)
+        - csp: Content Security Policy for the iframe
+        - permissions: List of permissions the UI needs
+
+        Args:
+            content: The raw content from ToolReturnPart.content
+
+        Returns:
+            UiMetadata if present, None otherwise
+        """
+        meta = None
+
+        # Check dict content
+        if isinstance(content, dict):
+            meta = content.get("_meta", {}).get("ui")
+        # Check object with _meta attribute
+        elif hasattr(content, '_meta'):
+            _meta = content._meta
+            if hasattr(_meta, 'ui'):
+                meta = _meta.ui
+            elif isinstance(_meta, dict):
+                meta = _meta.get("ui")
+
+        # Validate and construct UiMetadata
+        if meta and isinstance(meta, dict) and "resourceUri" in meta:
+            return UiMetadata(
+                resourceUri=meta["resourceUri"],
+                csp=meta.get("csp"),
+                permissions=meta.get("permissions", []),
+            )
+
+        return None
+
     async def run_stream(
         self,
         user_message: str,
@@ -1291,6 +1329,9 @@ class AgentOrchestrator:
                                 # Extract tool result content
                                 result_content = self._extract_tool_result_content(part.content)
 
+                                # Extract UI metadata if present
+                                ui_metadata = self._extract_ui_metadata(part.content)
+
                                 # Check for error - content might be dict or have is_error attribute
                                 is_error = False
                                 if isinstance(part.content, dict):
@@ -1315,6 +1356,7 @@ class AgentOrchestrator:
                                     result=result_content,
                                     is_error=is_error,
                                     latency_ms=latency_ms,
+                                    ui_metadata=ui_metadata,
                                 )
 
                 # Get the final response text
@@ -1422,6 +1464,7 @@ class AgentOrchestrator:
 
                             elif isinstance(part, ToolReturnPart):
                                 result_content = self._extract_tool_result_content(part.content)
+                                ui_metadata = self._extract_ui_metadata(part.content)
 
                                 tool_id = part.tool_call_id or "unknown"
                                 first_run_events.append(ToolResultEvent(
@@ -1429,6 +1472,7 @@ class AgentOrchestrator:
                                     result=result_content,
                                     is_error=False,
                                     latency_ms=0,
+                                    ui_metadata=ui_metadata,
                                 ))
 
                                 # Check if this is a search_tools result
@@ -1514,6 +1558,7 @@ class AgentOrchestrator:
 
                                 elif isinstance(part, ToolReturnPart):
                                     result_content = self._extract_tool_result_content(part.content)
+                                    ui_metadata = self._extract_ui_metadata(part.content)
 
                                     is_error = False
                                     if isinstance(part.content, dict):
@@ -1532,6 +1577,7 @@ class AgentOrchestrator:
                                         result=result_content,
                                         is_error=is_error,
                                         latency_ms=latency_ms,
+                                        ui_metadata=ui_metadata,
                                     )
 
                     # Stream second response

@@ -16,6 +16,7 @@ from forge_orchestrator.models.messages import (
     TokenEvent,
     ToolCallEvent,
     ToolResultEvent,
+    UiMetadata,
 )
 from forge_orchestrator.models.openrouter import (
     ModelInfo,
@@ -62,6 +63,7 @@ __all__ = [
     "ThinkingEvent",
     "ToolCallEvent",
     "ToolResultEvent",
+    "UiMetadata",
     "CompleteEvent",
     "ErrorEvent",
     "PingEvent",
