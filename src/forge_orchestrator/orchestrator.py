@@ -444,7 +444,18 @@ def _make_custom_tool_wrapper(
         result = await call_custom_server_tool(
             server_url, original_name, api_key, session_id=session_id, **kwargs
         )
-        return format_tool_result_for_llm(result, use_toon=use_toon)
+
+        # Extract _meta.ui before TOON conversion (same pattern as _make_tool_wrapper)
+        ui_meta = None
+        if isinstance(result, dict) and "_meta" in result:
+            ui_meta = result.pop("_meta")
+
+        formatted = format_tool_result_for_llm(result, use_toon=use_toon)
+
+        if ui_meta and isinstance(ui_meta, dict) and "ui" in ui_meta:
+            return {"_meta": ui_meta, "_content": formatted}
+
+        return formatted
 
     # Set __name__ for Pydantic AI
     wrapper.__name__ = prefixed_name
@@ -578,7 +589,20 @@ def _make_tool_wrapper(
         # Don't apply TOON to search_tools - we need to parse results for RAG auto-continue
         if tool_name == "search_tools":
             return result
-        return format_tool_result_for_llm(result, use_toon=use_toon)
+
+        # Extract _meta.ui before TOON conversion (TOON would flatten it into a string
+        # and _extract_ui_metadata wouldn't be able to find it later)
+        ui_meta = None
+        if isinstance(result, dict) and "_meta" in result:
+            ui_meta = result.pop("_meta")
+
+        formatted = format_tool_result_for_llm(result, use_toon=use_toon)
+
+        # Preserve _meta alongside formatted content so _extract_ui_metadata can find it
+        if ui_meta and isinstance(ui_meta, dict) and "ui" in ui_meta:
+            return {"_meta": ui_meta, "_content": formatted}
+
+        return formatted
 
     # Set __name__ so Pydantic AI can use it for schema generation
     wrapper.__name__ = tool_name
@@ -903,6 +927,11 @@ class AgentOrchestrator:
         Returns:
             Extracted content (dict, str, list, or the original if extraction fails)
         """
+        # Unwrap _meta wrapper dicts produced by _make_tool_wrapper
+        # These have {"_meta": {...}, "_content": <actual_content>}
+        if isinstance(content, dict) and "_content" in content and "_meta" in content:
+            return content["_content"]
+
         # If it's already a simple/clean type, return as-is
         if isinstance(content, (str, int, float, bool, type(None), dict, list)):
             return content
@@ -928,16 +957,22 @@ class AgentOrchestrator:
         # Fallback: convert to string
         return str(content)
 
-    def _extract_ui_metadata(self, content: Any) -> UiMetadata | None:
+    def _extract_ui_metadata(self, content: Any, tool_name: str | None = None) -> UiMetadata | None:
         """Extract _meta.ui from tool result if present.
 
         MCP Apps tools return UI metadata in _meta.ui field containing:
-        - resourceUri: URI to the UI resource (e.g., ui://weather__location-picker)
+        - resourceUri: URI to the UI resource (e.g., ui://location-picker)
         - csp: Content Security Policy for the iframe
         - permissions: List of permissions the UI needs
 
+        The resourceUri from MCP servers is unprefixed (e.g., ui://location-picker).
+        Armory expects a prefixed URI (e.g., ui://weather__location-picker) for routing.
+        If tool_name contains a backend prefix (e.g., weather__pick_location), we
+        automatically add it to the resourceUri.
+
         Args:
             content: The raw content from ToolReturnPart.content
+            tool_name: The tool name (used to extract backend prefix for URI)
 
         Returns:
             UiMetadata if present, None otherwise
@@ -957,10 +992,23 @@ class AgentOrchestrator:
 
         # Validate and construct UiMetadata
         if meta and isinstance(meta, dict) and "resourceUri" in meta:
+            resource_uri = meta["resourceUri"]
+
+            # Add backend prefix to ui:// URIs if not already prefixed.
+            # MCP servers return unprefixed URIs (ui://location-picker) but
+            # Armory needs the backend prefix for routing (ui://weather__location-picker).
+            if resource_uri.startswith("ui://") and tool_name and "__" in tool_name:
+                backend_prefix = tool_name.split("__", 1)[0]
+                path = resource_uri[len("ui://"):]
+                # Only add prefix if not already present
+                if "__" not in path:
+                    resource_uri = f"ui://{backend_prefix}__{path}"
+
             return UiMetadata(
-                resourceUri=meta["resourceUri"],
+                resourceUri=resource_uri,
                 csp=meta.get("csp"),
                 permissions=meta.get("permissions", []),
+                requiresInteraction=meta.get("requiresInteraction", False),
             )
 
         return None
@@ -1249,6 +1297,83 @@ class AgentOrchestrator:
                 retryable=True,
             )
 
+    def _collect_events_with_interaction_check(
+        self,
+        new_messages: list[Any],
+    ) -> tuple[list[SSEEvent], str | None]:
+        """Collect tool events from messages, stopping at interactive tools.
+
+        Iterates through new_messages parts (ToolCallPart, ToolReturnPart),
+        building ToolCallEvent + ToolResultEvent for each tool. When a
+        ToolReturnPart has ui_metadata.requiresInteraction == True, stops
+        collecting immediately and returns events so far + the interactive
+        tool_call_id.
+
+        Args:
+            new_messages: Messages from agent.run() result.new_messages().
+
+        Returns:
+            Tuple of (collected events, interactive_tool_call_id or None).
+        """
+        events: list[SSEEvent] = []
+        tool_call_timestamps: dict[str, Any] = {}
+        interactive_tool_id: str | None = None
+
+        for msg in new_messages:
+            if not hasattr(msg, 'parts'):
+                continue
+            for part in msg.parts:
+                if isinstance(part, ToolCallPart):
+                    args = _parse_tool_args(part.args)
+                    tool_id = part.tool_call_id or f"tc_{uuid.uuid4().hex[:8]}"
+                    events.append(ToolCallEvent(
+                        id=tool_id,
+                        tool_name=part.tool_name,
+                        arguments=args,
+                        status="complete",
+                    ))
+                    tool_call_timestamps[tool_id] = getattr(msg, 'timestamp', None)
+
+                elif isinstance(part, ToolReturnPart):
+                    result_content = self._extract_tool_result_content(part.content)
+                    ui_metadata = self._extract_ui_metadata(part.content, part.tool_name)
+
+                    is_error = False
+                    if isinstance(part.content, dict):
+                        is_error = part.content.get('is_error', False)
+                    elif hasattr(part.content, 'isError'):
+                        is_error = bool(part.content.isError)
+                    elif hasattr(part.content, 'is_error'):
+                        is_error = bool(part.content.is_error)
+
+                    tool_id = part.tool_call_id or "unknown"
+                    call_timestamp = tool_call_timestamps.get(tool_id)
+                    return_timestamp = part.timestamp
+                    latency_ms = 0
+                    if call_timestamp and return_timestamp:
+                        delta = return_timestamp - call_timestamp
+                        latency_ms = int(delta.total_seconds() * 1000)
+
+                    events.append(ToolResultEvent(
+                        tool_call_id=tool_id,
+                        result=result_content,
+                        is_error=is_error,
+                        latency_ms=latency_ms,
+                        ui_metadata=ui_metadata,
+                    ))
+
+                    # Check if this tool requires user interaction
+                    if ui_metadata and ui_metadata.requiresInteraction:
+                        interactive_tool_id = tool_id
+                        logger.info(
+                            "Interactive tool detected, truncating subsequent events",
+                            tool_name=part.tool_name,
+                            tool_call_id=tool_id,
+                        )
+                        return events, interactive_tool_id
+
+        return events, interactive_tool_id
+
     async def _run_non_streaming(
         self,
         agent: Agent,
@@ -1292,72 +1417,27 @@ class AgentOrchestrator:
                             )
                         break
 
-                # Extract tool calls and results from message history
-                # Track tool call timestamps for latency calculation
-                tool_call_timestamps: dict[str, Any] = {}
+                # Extract tool events with interaction check
+                collected_events, interactive_tool_id = (
+                    self._collect_events_with_interaction_check(list(result.new_messages()))
+                )
 
-                for msg in result.new_messages():
-                    if hasattr(msg, 'parts'):
-                        for part in msg.parts:
-                            if isinstance(part, ToolCallPart):
-                                logger.info(
-                                    "Tool call executed",
-                                    tool_name=part.tool_name,
-                                    tool_call_id=part.tool_call_id,
-                                )
-                                args = _parse_tool_args(part.args)
+                # Yield all collected events
+                for event in collected_events:
+                    yield event
 
-                                tool_id = part.tool_call_id or f"tc_{uuid.uuid4().hex[:8]}"
-                                yield ToolCallEvent(
-                                    id=tool_id,
-                                    tool_name=part.tool_name,
-                                    arguments=args,
-                                    status="complete",
-                                )
-
-                                # Store message timestamp for latency calculation
-                                # ToolCallPart doesn't have timestamp, but parent ModelResponse does
-                                tool_call_timestamps[tool_id] = getattr(msg, 'timestamp', None)
-
-                            elif isinstance(part, ToolReturnPart):
-                                logger.info(
-                                    "Tool result received",
-                                    tool_name=part.tool_name,
-                                    tool_call_id=part.tool_call_id,
-                                )
-
-                                # Extract tool result content
-                                result_content = self._extract_tool_result_content(part.content)
-
-                                # Extract UI metadata if present
-                                ui_metadata = self._extract_ui_metadata(part.content)
-
-                                # Check for error - content might be dict or have is_error attribute
-                                is_error = False
-                                if isinstance(part.content, dict):
-                                    is_error = part.content.get('is_error', False)
-                                elif hasattr(part.content, 'isError'):
-                                    is_error = bool(part.content.isError)
-                                elif hasattr(part.content, 'is_error'):
-                                    is_error = bool(part.content.is_error)
-
-                                # Calculate latency from timestamps
-                                # ToolReturnPart has its own timestamp field
-                                tool_id = part.tool_call_id or "unknown"
-                                call_timestamp = tool_call_timestamps.get(tool_id)
-                                return_timestamp = part.timestamp
-                                latency_ms = 0
-                                if call_timestamp and return_timestamp:
-                                    delta = return_timestamp - call_timestamp
-                                    latency_ms = int(delta.total_seconds() * 1000)
-
-                                yield ToolResultEvent(
-                                    tool_call_id=tool_id,
-                                    result=result_content,
-                                    is_error=is_error,
-                                    latency_ms=latency_ms,
-                                    ui_metadata=ui_metadata,
-                                )
+                # If an interactive tool was found, pause and let the user interact
+                if interactive_tool_id is not None:
+                    logger.info(
+                        "Pausing for interactive tool, discarding LLM response",
+                        interactive_tool_id=interactive_tool_id,
+                    )
+                    yield CompleteEvent(
+                        response="",
+                        awaiting_interaction=True,
+                        interactive_tool_call_id=interactive_tool_id,
+                    )
+                    return
 
                 # Get the final response text
                 response_text = str(result.output) if result.output else ""
@@ -1464,7 +1544,7 @@ class AgentOrchestrator:
 
                             elif isinstance(part, ToolReturnPart):
                                 result_content = self._extract_tool_result_content(part.content)
-                                ui_metadata = self._extract_ui_metadata(part.content)
+                                ui_metadata = self._extract_ui_metadata(part.content, part.tool_name)
 
                                 tool_id = part.tool_call_id or "unknown"
                                 first_run_events.append(ToolResultEvent(
@@ -1539,46 +1619,29 @@ class AgentOrchestrator:
                         message_history=updated_history,
                     )
 
-                    # Process second iteration events
-                    tool_call_timestamps: dict[str, Any] = {}
-                    for msg in result2.new_messages():
-                        if hasattr(msg, 'parts'):
-                            for part in msg.parts:
-                                if isinstance(part, ToolCallPart):
-                                    args = _parse_tool_args(part.args)
+                    # Extract tool events with interaction check
+                    collected_events, interactive_tool_id = (
+                        self._collect_events_with_interaction_check(
+                            list(result2.new_messages())
+                        )
+                    )
 
-                                    tool_id = part.tool_call_id or f"tc_{uuid.uuid4().hex[:8]}"
-                                    yield ToolCallEvent(
-                                        id=tool_id,
-                                        tool_name=part.tool_name,
-                                        arguments=args if isinstance(args, dict) else {},
-                                        status="complete",
-                                    )
-                                    tool_call_timestamps[tool_id] = getattr(msg, 'timestamp', None)
+                    # Yield all collected events
+                    for event in collected_events:
+                        yield event
 
-                                elif isinstance(part, ToolReturnPart):
-                                    result_content = self._extract_tool_result_content(part.content)
-                                    ui_metadata = self._extract_ui_metadata(part.content)
-
-                                    is_error = False
-                                    if isinstance(part.content, dict):
-                                        is_error = part.content.get('is_error', False)
-
-                                    tool_id = part.tool_call_id or "unknown"
-                                    call_timestamp = tool_call_timestamps.get(tool_id)
-                                    return_timestamp = part.timestamp
-                                    latency_ms = 0
-                                    if call_timestamp and return_timestamp:
-                                        delta = return_timestamp - call_timestamp
-                                        latency_ms = int(delta.total_seconds() * 1000)
-
-                                    yield ToolResultEvent(
-                                        tool_call_id=tool_id,
-                                        result=result_content,
-                                        is_error=is_error,
-                                        latency_ms=latency_ms,
-                                        ui_metadata=ui_metadata,
-                                    )
+                    # If an interactive tool was found, pause for user interaction
+                    if interactive_tool_id is not None:
+                        logger.info(
+                            "RAG auto-continue: Pausing for interactive tool",
+                            interactive_tool_id=interactive_tool_id,
+                        )
+                        yield CompleteEvent(
+                            response="",
+                            awaiting_interaction=True,
+                            interactive_tool_call_id=interactive_tool_id,
+                        )
+                        return
 
                     # Stream second response
                     second_response = str(result2.output) if result2.output else ""

@@ -42,6 +42,7 @@ class UiMetadata(BaseModel):
     resourceUri: str
     csp: str | None = None
     permissions: list[str] = []
+    requiresInteraction: bool = False
 
 
 class ToolResultEvent(BaseModel):
@@ -59,6 +60,8 @@ class CompleteEvent(BaseModel):
 
     response: str
     usage: TokenUsage | None = None
+    awaiting_interaction: bool = False
+    interactive_tool_call_id: str | None = None
 
 
 class ErrorEvent(BaseModel):
