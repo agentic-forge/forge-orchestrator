@@ -325,6 +325,90 @@ async def get_resource(
         ) from e
 
 
+class ToolCallRequest(BaseModel):
+    """Request body for calling an MCP tool via the app bridge."""
+
+    tool_name: str = Field(description="Full tool name (e.g., 'weather__geocode')")
+    arguments: dict[str, Any] = Field(default_factory=dict, description="Tool arguments")
+
+
+@app.post("/api/tools/call")
+async def call_tool(
+    request: Request,
+    body: ToolCallRequest,
+) -> dict[str, Any]:
+    """Call an MCP tool through Armory.
+
+    Used by MCP App iframes (via the app bridge) to invoke server-side tools,
+    e.g., the location picker calling geocode for city search.
+
+    Args:
+        body: Tool name and arguments
+
+    Returns:
+        The tool call result content
+    """
+    orchestrator: AgentOrchestrator = request.app.state.orchestrator
+
+    # Build JSON-RPC request for Armory
+    request_body = {
+        "jsonrpc": "2.0",
+        "id": str(uuid.uuid4()),
+        "method": "tools/call",
+        "params": {
+            "name": body.tool_name,
+            "arguments": body.arguments,
+        },
+    }
+
+    armory_url = orchestrator.settings.armory_url
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                armory_url,
+                json=request_body,
+                headers={"Content-Type": "application/json"},
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            result = response.json()
+
+        # Check for JSON-RPC error
+        if "error" in result:
+            error = result["error"]
+            raise HTTPException(
+                status_code=400,
+                detail=error.get("message", str(error)),
+            )
+
+        # Extract text content from MCP result
+        content_items = result.get("result", {}).get("content", [])
+        text_parts = [
+            item.get("text", "")
+            for item in content_items
+            if item.get("type") == "text"
+        ]
+
+        return {
+            "content": "\n".join(text_parts) if text_parts else "",
+            "raw": content_items,
+        }
+
+    except httpx.RequestError as e:
+        logger.error("Failed to call tool via Armory", tool=body.tool_name, error=str(e))
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to call tool via Armory: {e}",
+        ) from e
+    except httpx.HTTPStatusError as e:
+        logger.error("Armory returned error for tool call", tool=body.tool_name, status=e.response.status_code)
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=f"Armory error: {e.response.text}",
+        ) from e
+
+
 @app.post("/mcp/validate", response_model=MCPValidateResponse)
 async def validate_mcp_server(body: MCPServerInput) -> MCPValidateResponse:
     """Validate a custom MCP server by testing connectivity.
