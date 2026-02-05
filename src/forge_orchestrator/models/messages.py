@@ -32,6 +32,19 @@ class ToolCallEvent(BaseModel):
     status: Literal["pending", "executing", "complete", "error"]
 
 
+class UiMetadata(BaseModel):
+    """MCP Apps UI metadata.
+
+    Contains information about a UI resource that can be rendered
+    in the chat interface.
+    """
+
+    resourceUri: str
+    csp: str | None = None
+    permissions: list[str] = []
+    requiresInteraction: bool = False
+
+
 class ToolResultEvent(BaseModel):
     """Tool execution result event."""
 
@@ -39,6 +52,7 @@ class ToolResultEvent(BaseModel):
     result: Any
     is_error: bool
     latency_ms: int
+    ui_metadata: UiMetadata | None = None
 
 
 class CompleteEvent(BaseModel):
@@ -46,6 +60,8 @@ class CompleteEvent(BaseModel):
 
     response: str
     usage: TokenUsage | None = None
+    awaiting_interaction: bool = False
+    interactive_tool_call_id: str | None = None
 
 
 class ErrorEvent(BaseModel):

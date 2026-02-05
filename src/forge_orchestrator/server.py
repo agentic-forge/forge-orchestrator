@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
 
+import httpx
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
@@ -237,6 +240,173 @@ async def refresh_tools(request: Request) -> ToolsRefreshResponse:
     orchestrator: AgentOrchestrator = request.app.state.orchestrator
     tools = await orchestrator.refresh_tools()
     return ToolsRefreshResponse(status="refreshed", tool_count=len(tools))
+
+
+@app.get("/api/resources")
+async def get_resource(
+    request: Request,
+    uri: Annotated[str, Query(description="Resource URI to fetch")],
+) -> Response:
+    """Fetch a UI resource from Armory.
+
+    Used by forge-ui to fetch MCP App HTML content for rendering in iframes.
+    Only supports ui:// resource URIs.
+
+    Args:
+        uri: The resource URI (e.g., ui://weather__location-picker)
+
+    Returns:
+        The resource content with appropriate MIME type
+    """
+    if not uri.startswith("ui://"):
+        raise HTTPException(
+            status_code=400,
+            detail="Only ui:// resources are supported",
+        )
+
+    orchestrator: AgentOrchestrator = request.app.state.orchestrator
+
+    # Build JSON-RPC request for Armory
+    request_body = {
+        "jsonrpc": "2.0",
+        "id": str(uuid.uuid4()),
+        "method": "resources/read",
+        "params": {"uri": uri},
+    }
+
+    armory_url = orchestrator.settings.armory_url
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                armory_url,
+                json=request_body,
+                headers={"Content-Type": "application/json"},
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            result = response.json()
+
+        # Check for JSON-RPC error
+        if "error" in result:
+            error = result["error"]
+            raise HTTPException(
+                status_code=404,
+                detail=error.get("message", str(error)),
+            )
+
+        # Extract resource contents
+        contents = result.get("result", {}).get("contents", [])
+        if not contents:
+            # Check for _error in result
+            error_msg = result.get("result", {}).get("_error")
+            if error_msg:
+                raise HTTPException(status_code=404, detail=error_msg)
+            raise HTTPException(status_code=404, detail="Resource not found")
+
+        # Get the first content item
+        first_content = contents[0]
+        html_content = first_content.get("text", "")
+        mime_type = first_content.get("mimeType", "text/html")
+
+        return Response(content=html_content, media_type=mime_type)
+
+    except httpx.RequestError as e:
+        logger.error("Failed to fetch resource from Armory", uri=uri, error=str(e))
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to fetch resource from Armory: {e}",
+        ) from e
+    except httpx.HTTPStatusError as e:
+        logger.error("Armory returned error", uri=uri, status=e.response.status_code)
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=f"Armory error: {e.response.text}",
+        ) from e
+
+
+class ToolCallRequest(BaseModel):
+    """Request body for calling an MCP tool via the app bridge."""
+
+    tool_name: str = Field(description="Full tool name (e.g., 'weather__geocode')")
+    arguments: dict[str, Any] = Field(default_factory=dict, description="Tool arguments")
+
+
+@app.post("/api/tools/call")
+async def call_tool(
+    request: Request,
+    body: ToolCallRequest,
+) -> dict[str, Any]:
+    """Call an MCP tool through Armory.
+
+    Used by MCP App iframes (via the app bridge) to invoke server-side tools,
+    e.g., the location picker calling geocode for city search.
+
+    Args:
+        body: Tool name and arguments
+
+    Returns:
+        The tool call result content
+    """
+    orchestrator: AgentOrchestrator = request.app.state.orchestrator
+
+    # Build JSON-RPC request for Armory
+    request_body = {
+        "jsonrpc": "2.0",
+        "id": str(uuid.uuid4()),
+        "method": "tools/call",
+        "params": {
+            "name": body.tool_name,
+            "arguments": body.arguments,
+        },
+    }
+
+    armory_url = orchestrator.settings.armory_url
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                armory_url,
+                json=request_body,
+                headers={"Content-Type": "application/json"},
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            result = response.json()
+
+        # Check for JSON-RPC error
+        if "error" in result:
+            error = result["error"]
+            raise HTTPException(
+                status_code=400,
+                detail=error.get("message", str(error)),
+            )
+
+        # Extract text content from MCP result
+        content_items = result.get("result", {}).get("content", [])
+        text_parts = [
+            item.get("text", "")
+            for item in content_items
+            if item.get("type") == "text"
+        ]
+
+        return {
+            "content": "\n".join(text_parts) if text_parts else "",
+            "raw": content_items,
+        }
+
+    except httpx.RequestError as e:
+        logger.error("Failed to call tool via Armory", tool=body.tool_name, error=str(e))
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to call tool via Armory: {e}",
+        ) from e
+    except httpx.HTTPStatusError as e:
+        logger.error("Armory returned error for tool call", tool=body.tool_name, status=e.response.status_code)
+        raise HTTPException(
+            status_code=e.response.status_code,
+            detail=f"Armory error: {e.response.text}",
+        ) from e
 
 
 @app.post("/mcp/validate", response_model=MCPValidateResponse)
