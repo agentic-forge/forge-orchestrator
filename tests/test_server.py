@@ -14,10 +14,12 @@ if TYPE_CHECKING:
 @pytest.fixture
 def test_app(initialized_orchestrator: AgentOrchestrator) -> TestClient:
     """Create a test client with mock dependencies."""
+    from forge_orchestrator.keys import KeyProvider
     from forge_orchestrator.server import app
 
     # Override app state
     app.state.orchestrator = initialized_orchestrator
+    app.state.key_provider = KeyProvider(initialized_orchestrator.settings)
 
     return TestClient(app, raise_server_exceptions=False)
 

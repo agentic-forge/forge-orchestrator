@@ -14,6 +14,7 @@ from forge_orchestrator.models import (
     TokenUsage,
     ToolCallEvent,
     ToolResultEvent,
+    UiMetadata,
 )
 from forge_orchestrator.models.messages import get_event_type
 
@@ -94,6 +95,68 @@ class TestSSEEventModels:
         assert get_event_type(CompleteEvent(response="")) == "complete"
         assert get_event_type(ErrorEvent(code="", message="", retryable=False)) == "error"
         assert get_event_type(PingEvent(timestamp=0)) == "ping"
+
+    def test_ui_metadata_defaults(self) -> None:
+        """Test UiMetadata default values."""
+        meta = UiMetadata(resourceUri="ui://location-picker")
+        assert meta.resourceUri == "ui://location-picker"
+        assert meta.csp is None
+        assert meta.permissions == []
+        assert meta.requiresInteraction is False
+
+    def test_ui_metadata_requires_interaction(self) -> None:
+        """Test UiMetadata with requiresInteraction flag."""
+        meta = UiMetadata(
+            resourceUri="ui://location-picker",
+            permissions=["geolocation"],
+            requiresInteraction=True,
+        )
+        assert meta.requiresInteraction is True
+        assert meta.permissions == ["geolocation"]
+
+    def test_tool_result_event_with_ui_metadata(self) -> None:
+        """Test ToolResultEvent with UiMetadata containing requiresInteraction."""
+        meta = UiMetadata(
+            resourceUri="ui://location-picker",
+            requiresInteraction=True,
+        )
+        event = ToolResultEvent(
+            tool_call_id="tc_456",
+            result={"initial_location": None},
+            is_error=False,
+            latency_ms=50,
+            ui_metadata=meta,
+        )
+        assert event.ui_metadata is not None
+        assert event.ui_metadata.requiresInteraction is True
+
+    def test_complete_event_defaults(self) -> None:
+        """Test CompleteEvent default values for interaction fields."""
+        event = CompleteEvent(response="Hello")
+        assert event.awaiting_interaction is False
+        assert event.interactive_tool_call_id is None
+
+    def test_complete_event_awaiting_interaction(self) -> None:
+        """Test CompleteEvent with awaiting_interaction flag."""
+        event = CompleteEvent(
+            response="",
+            awaiting_interaction=True,
+            interactive_tool_call_id="tc_789",
+        )
+        assert event.awaiting_interaction is True
+        assert event.interactive_tool_call_id == "tc_789"
+        assert event.response == ""
+
+    def test_complete_event_serialization(self) -> None:
+        """Test CompleteEvent serializes interaction fields correctly."""
+        event = CompleteEvent(
+            response="",
+            awaiting_interaction=True,
+            interactive_tool_call_id="tc_001",
+        )
+        data = event.model_dump()
+        assert data["awaiting_interaction"] is True
+        assert data["interactive_tool_call_id"] == "tc_001"
 
 
 class TestConversationModels:

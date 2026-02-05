@@ -125,34 +125,40 @@ class TestGetModelString:
         assert result == "openrouter:meta-llama/llama-3-70b"
 
 
-class TestNativeProviderRouting:
-    """Tests for routing OpenRouter format models to native providers."""
+class TestSlashFormatRouting:
+    """Tests for routing slash-format models.
 
-    def test_google_model_routes_to_native_when_key_available(
+    Slash-format models (provider/model) always route to OpenRouter.
+    This respects user's explicit choice - if they want native routing,
+    they use the explicit provider prefix (e.g., google-gla:gemini-2.0-flash)
+    or the frontend composite format (e.g., google::gemini-2.0-flash).
+    """
+
+    def test_google_slash_format_routes_to_openrouter(
         self, orchestrator_all_keys: AgentOrchestrator
     ) -> None:
-        """Google model should route to native API when GEMINI_API_KEY is set."""
+        """Google slash-format should route to OpenRouter, not native."""
         result = orchestrator_all_keys._get_model_string("google/gemini-3-flash-preview")
-        assert result == "google-gla:gemini-3-flash-preview"
+        assert result == "openrouter:google/gemini-3-flash-preview"
 
-    def test_anthropic_model_routes_to_native_when_key_available(
+    def test_anthropic_slash_format_routes_to_openrouter(
         self, orchestrator_all_keys: AgentOrchestrator
     ) -> None:
-        """Anthropic model should route to native API when ANTHROPIC_API_KEY is set."""
+        """Anthropic slash-format should route to OpenRouter, not native."""
         result = orchestrator_all_keys._get_model_string("anthropic/claude-sonnet-4")
-        assert result == "anthropic:claude-sonnet-4"
+        assert result == "openrouter:anthropic/claude-sonnet-4"
 
-    def test_openai_model_routes_to_native_when_key_available(
+    def test_openai_slash_format_routes_to_openrouter(
         self, orchestrator_all_keys: AgentOrchestrator
     ) -> None:
-        """OpenAI model should route to native API when OPENAI_API_KEY is set."""
+        """OpenAI slash-format should route to OpenRouter, not native."""
         result = orchestrator_all_keys._get_model_string("openai/gpt-4o")
-        assert result == "openai:gpt-4o"
+        assert result == "openrouter:openai/gpt-4o"
 
-    def test_meta_llama_always_routes_to_openrouter(
+    def test_meta_llama_routes_to_openrouter(
         self, orchestrator_all_keys: AgentOrchestrator
     ) -> None:
-        """Meta-Llama models should always route to OpenRouter (no native API)."""
+        """Meta-Llama models should route to OpenRouter."""
         result = orchestrator_all_keys._get_model_string("meta-llama/llama-3.3-70b-instruct")
         assert result == "openrouter:meta-llama/llama-3.3-70b-instruct"
 
@@ -182,44 +188,36 @@ class TestOpenRouterFallback:
         assert result == "openrouter:openai/gpt-4o"
 
 
-class TestTryNativeProviderFromOpenRouterFormat:
-    """Tests for _try_native_provider_from_openrouter_format method."""
+class TestCompositeFormatRouting:
+    """Tests for frontend composite format (provider::model) routing."""
 
-    def test_returns_none_for_non_slash_model(
+    def test_openrouter_composite_format(
         self, orchestrator_all_keys: AgentOrchestrator
     ) -> None:
-        """Should return None for models without slash."""
-        result = orchestrator_all_keys._try_native_provider_from_openrouter_format("gpt-4o")
-        assert result is None
+        """Composite format with openrouter should route correctly."""
+        result = orchestrator_all_keys._get_model_string("openrouter::google/gemini-3-flash-preview")
+        assert result == "openrouter:google/gemini-3-flash-preview"
 
-    def test_extracts_model_name_correctly(
+    def test_google_composite_format(
         self, orchestrator_all_keys: AgentOrchestrator
     ) -> None:
-        """Should correctly extract model name after provider prefix."""
-        result = orchestrator_all_keys._try_native_provider_from_openrouter_format(
-            "google/gemini-2.0-flash-exp"
-        )
-        assert result == "google-gla:gemini-2.0-flash-exp"
-
-    def test_handles_model_with_multiple_slashes(
-        self, orchestrator_all_keys: AgentOrchestrator
-    ) -> None:
-        """Should handle model names with multiple path components."""
-        # Some models might have paths like "org/repo/model"
-        result = orchestrator_all_keys._try_native_provider_from_openrouter_format(
-            "google/some/nested/model"
-        )
-        # Should split only on first slash
-        assert result == "google-gla:some/nested/model"
-
-    def test_case_insensitive_provider_matching(
-        self, orchestrator_all_keys: AgentOrchestrator
-    ) -> None:
-        """Provider matching should be case insensitive."""
-        result = orchestrator_all_keys._try_native_provider_from_openrouter_format(
-            "Google/gemini-2.0-flash"
-        )
+        """Composite format with google should route to google-gla."""
+        result = orchestrator_all_keys._get_model_string("google::gemini-2.0-flash")
         assert result == "google-gla:gemini-2.0-flash"
+
+    def test_anthropic_composite_format(
+        self, orchestrator_all_keys: AgentOrchestrator
+    ) -> None:
+        """Composite format with anthropic should route correctly."""
+        result = orchestrator_all_keys._get_model_string("anthropic::claude-sonnet-4")
+        assert result == "anthropic:claude-sonnet-4"
+
+    def test_openai_composite_format(
+        self, orchestrator_all_keys: AgentOrchestrator
+    ) -> None:
+        """Composite format with openai should route correctly."""
+        result = orchestrator_all_keys._get_model_string("openai::gpt-4o")
+        assert result == "openai:gpt-4o"
 
 
 class TestAutoDetectProvider:

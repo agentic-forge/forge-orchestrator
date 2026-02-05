@@ -29,10 +29,12 @@ def mock_settings(tmp_path: Path) -> Settings:
         host="127.0.0.1",
         port=8001,
         models_cache_file=tmp_path / "models_cache.json",
+        models_config_file=tmp_path / "models_config.json",
         mock_llm=True,
         show_thinking=True,
         heartbeat_interval=15,
         tool_timeout_warning=30,
+        openrouter_api_key="sk-test-mock-key",
     )
 
 
